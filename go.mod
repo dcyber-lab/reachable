@@ -1,3 +1,3 @@
 module github.com/dcyber-lab/reachable
 
-go 1.22
+go 1.24.0
