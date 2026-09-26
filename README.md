@@ -29,6 +29,9 @@ A -> B  10.0.2.7
 
 ## Install
 
+Binaries for Linux and macOS (amd64, arm64) are on the
+[releases page](https://github.com/dcyber-lab/reachable/releases), or:
+
 ```
 go install github.com/dcyber-lab/reachable@latest
 ```
@@ -53,6 +56,7 @@ there), everything after is multiplexed over it.
 | flag | default | |
 |---|---|---|
 | `-p` | `22` | TCP ports to test, comma-separated, both directions |
+| `-u` | | UDP ports to test, same |
 | `-b-addr` / `-a-addr` | HostName from `ssh -G` | address A dials to reach B / B dials to reach A |
 | `-one-way` | off | only A -> B |
 | `-c` | 5 | pings per direction |
@@ -94,6 +98,13 @@ addresses as a hint.
 
   Ports below 1024 need root for the listener; without one, `refused` still
   proves packets reach the destination's kernel.
+- **udp/N** — UDP has no handshake, so the only proof is a listener
+  (python3 or socat) on the destination receiving the probe; it answers,
+  which tests the way back too. Reply came back: fine. Arrived but no
+  reply: the return path filters UDP (stateful firewall, asymmetric
+  route). Never arrived: dropped. ICMP port-unreachable while our listener
+  was up: a REJECT rule. A port something already holds can't be checked
+  and is reported as `skip`.
 - **pmtu** — the biggest DF packet that gets through. If bigger ones get
   an ICMP "fragmentation needed" back, fine; if they vanish silently it is
   a PMTU black hole, the classic "ssh works but scp/https hangs".
@@ -102,12 +113,25 @@ addresses as a hint.
 - **trace** — tracepath/traceroute from the source, by default only when
   something failed.
 
+IPv4 and IPv6 both work: pass a v6 address to `-a-addr` / `-b-addr`, or
+a name that resolves to one.
+
 ## Development
 
 ```
 make test    # go vet + unit tests
-make lint    # shellcheck the remote scripts
+make lint    # shellcheck
+make e2e     # end-to-end, needs root (sudo)
 ```
+
+`make e2e` builds two network namespaces joined by a veth pair, runs sshd
+in each, and checks reachable's verdicts against faults injected with
+iptables: DROP and REJECT for TCP and UDP, SNAT, a REDIRECT that answers
+for the destination, a UDP return path filter, filtered ICMP, a PMTU black
+hole, a destination with no route, DNS on the source, IPv6, and the socat
+and nc listener fallbacks. CI runs it on every push, with IPv6 required.
+
+Releases: push a `v*` tag and goreleaser builds and publishes them.
 
 The remote side is plain bash in `internal/probe/scripts/`, embedded in the
 binary and fed to `ssh host bash -s`. Each script wraps its body in
