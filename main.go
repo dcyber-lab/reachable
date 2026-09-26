@@ -60,6 +60,7 @@ type flags struct {
 	bw           bool
 	iperfPort    int
 	iperfTime    time.Duration
+	locate       bool
 	ssh          string
 	batch        bool
 	json         bool
@@ -79,6 +80,7 @@ func run() int {
 	flag.BoolVar(&f.bw, "bw", true, "measure bandwidth (iperf3) when both machines can")
 	flag.IntVar(&f.iperfPort, "iperf-port", 5201, "port for the bandwidth test")
 	flag.DurationVar(&f.iperfTime, "iperf-time", 3*time.Second, "length of each bandwidth test")
+	flag.BoolVar(&f.locate, "locate", true, "when a port fails, find where its packets die (needs root or passwordless sudo, tcpdump; bpftrace for more)")
 	flag.StringVar(&f.ssh, "ssh", "", `extra ssh arguments, e.g. "-p 2222 -i ~/.ssh/key"`)
 	flag.BoolVar(&f.batch, "batch", false, "never prompt (passwords, host keys); implied when stdin is not a terminal")
 	flag.BoolVar(&f.json, "json", false, "print JSON (see README for the schema)")
@@ -211,6 +213,7 @@ func (f flags) options() (probe.Options, error) {
 		Bandwidth:      f.bw,
 		IperfPort:      f.iperfPort,
 		IperfTime:      f.iperfTime,
+		Locate:         f.locate,
 	}, nil
 }
 

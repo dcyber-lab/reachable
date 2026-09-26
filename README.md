@@ -75,6 +75,7 @@ A and B are written `BACKEND://TARGET`:
 | `-bw` | on | iperf3 bandwidth, when both machines can |
 | `-iperf-port` / `-iperf-time` | 5201 / 3s | |
 | `-ssh` | | extra ssh args, e.g. `"-p 2222 -i ~/.ssh/key"` |
+| `-locate` | on | when a port fails, find where its packets die (see below) |
 | `-batch` | when stdin isn't a terminal | never prompt for passwords or host keys; fail instead |
 | `-json` | off | machine-readable output, see below |
 
@@ -171,16 +172,85 @@ detail says why) or `<name>.error`.
 - **hint** — `hint.other_addrs`: nothing got through; the destination's
   other addresses, in case the wrong one was dialed.
 
+## Where packets die: `-locate`
+
+A timeout says packets were lost, not where. When a port fails, reachable
+watches both machines while it sends a few more probes, and reads the two
+observations against each other:
+
+- a **packet capture** (tcpdump) on each side says which stretch of the way
+  they died on: never left A, left A but never reached B, reached B but no
+  reply, reply left B but never reached A;
+- the **kernel's drop trace** (`skb:kfree_skb` through bpftrace, filtered
+  to our port) says in which function they were dropped, and on 5.17+ why;
+- **drop counters** snapshotted before and after: iptables/ip6tables rule
+  counters (naming the rule), nft rules with counters, `/proc/net/netstat`
+  and `snmp`, conntrack stats, tc qdisc drops, NIC and driver counters.
+  A quiet window measured first gives each counter's background rate, so
+  a busy machine's own drops aren't blamed on the probes.
+
+Nothing on the machines is changed: no rule, sysctl or program is added,
+and the capture and trace are filtered to the probed port and killed when
+done (they also stop by themselves if reachable dies).
+
+| what drops them | where | how it's found | needs |
+|---|---|---|---|
+| iptables / nftables rule or DROP policy | either side | drop trace `NETFILTER_DROP`; the rule's counter names it | counters: any kernel; trace: BTF |
+| tc eBPF, ingress or egress (clsact) | either side | trace `TC_INGRESS`/`TC_EGRESS`; clsact qdisc drop counter | counter: 4.5+ (clsact) |
+| tcx eBPF (6.6+) | either side | drop trace; listed from `bpftool net` | BTF, bpftool |
+| XDP, generic | destination | not in the capture; drop trace in `netif_receive_generic_xdp` | BTF |
+| XDP, native | destination | not in the capture; driver's xdp drop counter (`ethtool -S`) if it has one, else only suspected (`xdp_or_network`) | — |
+| reverse path filter | either side | trace `IP_RPFILTER`; `TcpExt IPReversePathFilter` | any kernel |
+| listen queue full | destination | `ListenOverflows` / `ListenDrops` | any kernel |
+| conntrack invalid / full | either side | `/proc/net/stat/nf_conntrack` | any kernel |
+| TCP timestamps behind NAT (`tcp_tw_recycle`, < 4.12) | destination | `PAWSPassive`; the sysctl in the inventory | any kernel |
+| NIC or driver (ring full) | destination | `rx_dropped`, `rx_missed_errors`, driver counters | any kernel |
+| cgroup eBPF / LSM refusing `connect()` | source | the connect fails with EPERM | — |
+| the network: security group, ACL, firewall | between | seen leaving one side, never arriving at the other, nothing on either machine explains it | captures |
+| a router rejecting | between | ICMP unreachable from an address that isn't the destination | capture |
+| a proxy / DNAT answering for the destination | between | replies arrive, the destination never saw a probe | captures |
+| the reply's way back (asymmetric routing through a stateful firewall) | between | reply seen leaving the destination, never arriving | captures |
+
+Each finding is a check named `locate tcp/N` with code `drop.<where>`
+(`src_egress`, `path`, `dst_nic`, `dst_xdp`, `dst_ingress`, `dst_egress`,
+`return_path`, `src_ingress`, `unknown`) and, in the JSON:
+
+- `where`, `mechanism` (`netfilter`, `tc`, `xdp`, `rp_filter`,
+  `listen_queue`, `conntrack`, `nic`, `network`, `network_reject`,
+  `intercepted`, `local_policy`, `xdp_or_network`, `unknown`, ...),
+- `confidence`: `observed` (the drop trace saw our packets dropped there),
+  `counted` (a counter there moved with the probes and not before), or
+  `inferred` (by elimination: seen before that point, not after),
+- `culprit`: the rule, program or counter when known,
+- `lines`: the evidence, one fact per line.
+
+It needs root on the machines, or passwordless `sudo` (`sudo -n`), and
+`tcpdump`; `bpftrace` and a kernel with BTF (`/sys/kernel/btf/vmlinux`,
+most distributions since 5.x) for the drop trace. Whatever is missing is
+listed in the evidence and the rest still runs: without the trace, counters
+still name iptables rules and tc drops; with only one side observable, that
+side's view is reported.
+
+What it can't see: native XDP drops on NICs whose driver keeps no XDP drop
+counter (reported as `xdp_or_network`); nftables rules without a
+`counter` on kernels without drop reasons; and anything in the network
+itself, which is only ever "not on either machine". A cloud security group
+lives in the hypervisor; the VPC's flow logs are where to confirm it.
+
+The drop trace sees every network namespace on a machine; drops in other
+namespaces (containers) are listed as such and not blamed on the machine.
+
 ## How it's built
 
 ```
 main.go                  CLI: flags, output
 internal/probe           the diagnosis: which checks, in what order, what a
-                         combination of results means. Knows only node.Node.
+                         combination of results means; locate.go reads two
+                         observations against each other. Knows only node.Node.
 internal/node            node.Node: what a machine must be able to do
                          (Facts, Resolve, Route, Ping, Dial, Listen, PMTU,
-                         Trace, bandwidth), with typed results; and the
-                         BACKEND:// registry.
+                         Trace, bandwidth, Observe), with typed results;
+                         and the BACKEND:// registry.
 internal/node/shell      a node.Node made of bash scripts, run through a
                          shell.Runner ("run this script, give me stdout")
 internal/transport       Runners and backends: ssh, local
@@ -220,8 +290,13 @@ with iptables: DROP and REJECT for TCP and UDP, SNAT, a REDIRECT that
 answers for the destination, a UDP return path filter, filtered ICMP, a PMTU
 black hole, a destination with no route, DNS on the source, IPv6, the
 `local://` backend, unreachable machines, back-to-back reruns, and the
-socat and nc listener fallbacks. CI runs it on every push, with IPv6
-required.
+socat and nc listener fallbacks. For `-locate`, a bridge namespace sits
+between the two as "the network", and each drop point above is staged in
+turn: iptables on either side, eBPF tc programs on ingress and egress and an
+XDP program (two-instruction stand-ins loaded by `test/e2e/bpfret.py`, no
+compiler needed), rp_filter, drops in the bridge each way, and the same
+without bpftrace or without root on one side. CI runs it on every push,
+with IPv6 required.
 
 The shell node's scripts are in `internal/node/shell/scripts/`, embedded in
 the binary and fed to `bash -s`. Each wraps its body in `main ... </dev/null`

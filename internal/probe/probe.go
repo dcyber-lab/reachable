@@ -34,6 +34,14 @@ type Check struct {
 	Code   string   `json:"code"`
 	Detail string   `json:"detail"`
 	Lines  []string `json:"lines,omitempty"`
+
+	// Set on "locate" checks: where probes died, what dropped them, how
+	// sure that is (observed, counted, inferred), and the rule or program
+	// when known.
+	Where      string `json:"where,omitempty"`
+	Mechanism  string `json:"mechanism,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	Culprit    string `json:"culprit,omitempty"`
 }
 
 // Side is one of the two nodes.
@@ -55,6 +63,9 @@ type Options struct {
 	Bandwidth      bool
 	IperfPort      int
 	IperfTime      time.Duration
+	// Locate finds where probes to a failing port die, on nodes that can
+	// observe (root, tcpdump, bpftrace).
+	Locate bool
 }
 
 // Result is the one-word outcome of a direction.
@@ -131,18 +142,23 @@ func (p *prober) check() {
 	}
 	ping := p.ping(ip)
 	var open, blocked []string
-	for _, port := range p.opt.TCPPorts {
-		if ok, known := p.port(node.TCP, ip, port, route); ok {
-			open = append(open, fmt.Sprintf("tcp/%d", port))
-		} else if known {
-			blocked = append(blocked, fmt.Sprintf("tcp/%d", port))
+	var troubled []protoPort
+	for _, pp := range append(portsOf(node.TCP, p.opt.TCPPorts), portsOf(node.UDP, p.opt.UDPPorts)...) {
+		name := fmt.Sprintf("%s/%d", pp.proto, pp.port)
+		ok, known := p.port(pp.proto, ip, pp.port, route)
+		switch {
+		case ok:
+			open = append(open, name)
+		case known:
+			blocked = append(blocked, name)
+		}
+		if c := d.Checks[len(d.Checks)-1]; known && c.Status != OK {
+			troubled = append(troubled, pp)
 		}
 	}
-	for _, port := range p.opt.UDPPorts {
-		if ok, known := p.port(node.UDP, ip, port, route); ok {
-			open = append(open, fmt.Sprintf("udp/%d", port))
-		} else if known {
-			blocked = append(blocked, fmt.Sprintf("udp/%d", port))
+	if p.opt.Locate {
+		for _, t := range troubled {
+			p.locate(t.proto, ip, t.port)
 		}
 	}
 	pinged := ping != nil && ping.Received > 0
@@ -183,6 +199,19 @@ func (p *prober) check() {
 	default:
 		d.Result, d.Verdict = Unreachable, "UNREACHABLE: no ping reply and every tested port is blocked"
 	}
+}
+
+type protoPort struct {
+	proto node.Proto
+	port  int
+}
+
+func portsOf(proto node.Proto, ports []int) []protoPort {
+	out := make([]protoPort, len(ports))
+	for i, port := range ports {
+		out[i] = protoPort{proto, port}
+	}
+	return out
 }
 
 // gotThrough reports whether anything at all reached dst at this address.

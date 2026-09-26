@@ -19,13 +19,20 @@ trap cleanup EXIT
 "$here/lab.sh" up "$work" || exit 1
 
 ns() { ip netns exec "$@"; }
+dev() { [ "$1" = ha ] && echo dA || echo dB; }
 has_v6() { [ -d /proc/sys/net/ipv6 ]; }
 reset() {
 	for n in ha hb; do
 		ns "$n" iptables -F
 		ns "$n" iptables -t nat -F
 		has_v6 && ns "$n" ip6tables -F
+		ns "$n" tc qdisc del dev "$(dev "$n")" clsact 2>/dev/null
+		ip -n "$n" link set dev "$(dev "$n")" xdpgeneric off 2>/dev/null
+		ns "$n" sysctl -qw net.ipv4.conf.all.rp_filter=0 "net.ipv4.conf.$(dev "$n").rp_filter=0"
 	done
+	ns hm nft flush ruleset
+	ns ha ip addr del 10.77.0.1/32 dev dA 2>/dev/null
+	ns hb ip route del 10.77.0.0/24 2>/dev/null
 	return 0
 }
 
@@ -44,7 +51,7 @@ scenario() {
 		python3 -m json.tool "$work/$name.json" | sed 's/^/      /'
 	fi
 }
-data="-a-addr 10.9.0.1 -b-addr 10.9.0.2"
+data="-a-addr 10.9.0.1 -b-addr 10.9.0.2 -locate=false"
 scripts=$here/../../internal/node/shell/scripts
 
 reset
@@ -134,10 +141,114 @@ scenario unknown-backend "nope://x hb" \
 scenario ssh-down "-p 22 ha root@10.8.1.99" \
 	'rc == 2' 'not d["ok"]' 'd["error"].startswith("ssh root@10.8.1.99")'
 
+# Where do packets die? Each scenario drops tcp/7777 (or udp/7778) at one
+# place and checks that locate names it. Stand-ins for eBPF programs are
+# loaded by bpfret.py: two instructions returning a verdict, no compiler.
+bpffs=$work/bpffs
+mkdir -p "$bpffs" && mount -t bpf bpf "$bpffs"
+python3 "$here/bpfret.py" xdp 1 "$bpffs/xdp_drop"
+python3 "$here/bpfret.py" tc 2 "$bpffs/tc_shot"
+tc_drop() { # tc_drop NS DEV ingress|egress
+	ns "$1" tc qdisc add dev "$2" clsact
+	ns "$1" tc filter add dev "$2" "$3" bpf direct-action object-pinned "$bpffs/tc_shot"
+}
+loc="$data -locate=true -one-way -p 7777 -bw=false -trace never ha hb"
+where() { # where WHERE MECHANISM CONFIDENCE [CULPRIT] -- assertions on "locate tcp/7777"
+	echo "chk(0, 'locate tcp/7777').get('where') == '$1'"
+	echo "chk(0, 'locate tcp/7777').get('mechanism') == '$2'"
+	echo "chk(0, 'locate tcp/7777').get('confidence') == '$3'"
+	[ -n "${4:-}" ] && echo "\"$4\" in chk(0, 'locate tcp/7777').get('culprit', '')"
+	echo "code(0, 'locate tcp/7777') == 'drop.$1'"
+}
+lscenario() { # lscenario NAME WHERE MECHANISM CONFIDENCE [CULPRIT]
+	local name=$1
+	shift
+	local asserts=()
+	mapfile -t asserts < <(where "$@")
+	scenario "$name" "$loc" 'rc == 1' "${asserts[@]}"
+}
+
+reset
+ns hb iptables -A INPUT -i dB -p tcp --dport 7777 -j DROP
+lscenario locate-dst-iptables dst_ingress netfilter observed "--dport 7777 -j DROP"
+
+reset
+tc_drop hb dB ingress
+lscenario locate-dst-tc dst_ingress tc observed "clsact on dB"
+
+reset
+ip -n hb link set dev dB xdpgeneric pinned "$bpffs/xdp_drop"
+lscenario locate-dst-xdp dst_xdp xdp observed
+
+reset
+tc_drop ha dA egress
+lscenario locate-src-tc src_egress tc observed "clsact on dA"
+
+reset
+tc_drop hb dB egress
+lscenario locate-dst-egress-tc dst_egress tc observed "clsact on dB"
+
+reset
+ns ha iptables -A INPUT -i dA -p tcp --sport 7777 -j DROP
+lscenario locate-src-ingress src_ingress netfilter observed "--sport 7777 -j DROP"
+
+# Reverse path filter: A's probes leave from an address B routes back out
+# of its management interface.
+reset
+ns ha ip addr add 10.77.0.1/32 dev dA
+ns ha iptables -t nat -A POSTROUTING -o dA -p tcp --dport 7777 -j SNAT --to-source 10.77.0.1
+ns hb ip route add 10.77.0.0/24 via 10.8.2.1 dev mgmt
+ns hb sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.dB.rp_filter=1
+lscenario locate-rp-filter dst_ingress rp_filter observed "reverse path filter"
+
+# The network between them: neither server sees the drop.
+reset
+ns hm nft add table bridge mid
+ns hm nft add chain bridge mid pass '{ type filter hook forward priority 0; }'
+ns hm nft add rule bridge mid pass tcp dport 7777 drop
+lscenario locate-network path network inferred
+reset
+ns hm nft add table bridge mid
+ns hm nft add chain bridge mid pass '{ type filter hook forward priority 0; }'
+ns hm nft add rule bridge mid pass tcp sport 7777 drop
+lscenario locate-return-path return_path network inferred
+
+reset
+ns hb iptables -A INPUT -i dB -p udp --dport 7778 -j DROP
+scenario locate-udp "$data -locate=true -one-way -p= -u 7778 -bw=false -trace never ha hb" \
+	'rc == 1' 'code(0, "locate udp/7778") == "drop.dst_ingress"' \
+	'chk(0, "locate udp/7778").get("mechanism") == "netfilter"' \
+	'"--dport 7778 -j DROP" in chk(0, "locate udp/7778").get("culprit", "")'
+
+# Without bpftrace on the machines (older kernels, no BTF): counters still
+# name an iptables rule, and XDP can only be suspected.
+reset
+for n in ha hb; do
+	nsenter -t "$(cat "$work/sshd-$n.pid")" -m mount --bind /bin/false "$(command -v bpftrace)"
+done
+ns hb iptables -A INPUT -i dB -p tcp --dport 7777 -j DROP
+lscenario locate-no-trace-iptables dst_ingress netfilter counted "--dport 7777 -j DROP"
+reset
+ip -n hb link set dev dB xdpgeneric pinned "$bpffs/xdp_drop"
+lscenario locate-no-trace-xdp unknown xdp_or_network inferred "XDP on B's dB"
+for n in ha hb; do
+	nsenter -t "$(cat "$work/sshd-$n.pid")" -m umount "$(command -v bpftrace)"
+done
+
+# B reached as a user without root: locate goes on with what A sees.
+reset
+id reachable-e2e >/dev/null 2>&1 || useradd -M -s /bin/bash -p '*' reachable-e2e
+ns hb iptables -A INPUT -i dB -p tcp --dport 7777 -j DROP
+scenario locate-not-root "$data -locate=true -one-way -p 7777 -bw=false -trace never ha reachable-e2e@hb" \
+	'rc == 1' 'code(0, "locate tcp/7777").startswith("drop.")' \
+	'any("B: not observed (needs root or passwordless sudo)" in l for l in chk(0, "locate tcp/7777").get("lines", []))'
+userdel reachable-e2e 2>/dev/null
+umount "$bpffs"
+
 if has_v6; then
 	reset
 	ns hb ip6tables -A INPUT -i dB -p tcp --dport 8081 -j DROP
-	scenario ipv6 "-a-addr fd00:9::1 -b-addr fd00:9::2 -p 22,8080,8081 -u 5353 -bw=false -trace never ha hb" \
+	scenario ipv6 "-a-addr fd00:9::1 -b-addr fd00:9::2 -locate=false -p 22,8080,8081 -u 5353 -bw=false -trace never ha hb" \
 		'rc == 1' \
 		'st(0, "route") == "ok" and st(0, "icmp") == "ok"' \
 		'st(0, "tcp/22") == "ok"' \

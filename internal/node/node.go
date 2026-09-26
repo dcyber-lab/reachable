@@ -137,6 +137,86 @@ type PMTU struct {
 	Method PMTUMethod
 }
 
+// ObserveSpec picks what an observation watches: packets to or from Port.
+type ObserveSpec struct {
+	Proto Proto
+	Port  int
+	// Baseline is a quiet window measured before Observe returns: how fast
+	// counters move without our probes, so a busy machine's background
+	// traffic isn't blamed on them.
+	Baseline time.Duration
+	// Lifetime bounds the observation if Stop never comes.
+	Lifetime time.Duration
+}
+
+// Hook is something attached on a node that can drop packets.
+type Hook struct {
+	Kind   string `json:"kind"`  // xdp, tc-ingress, tc-egress, tcx-ingress, tcx-egress, cgroup
+	Where  string `json:"where"` // device, or the cgroup attach type
+	Detail string `json:"detail,omitempty"`
+}
+
+// Inventory is what on a node could drop packets, and what an observation
+// there can and can't see.
+type Inventory struct {
+	Kernel         string         `json:"kernel"`
+	Hooks          []Hook         `json:"hooks,omitempty"`
+	Policies       []string       `json:"policies,omitempty"`  // firewall chains with a DROP policy
+	RPFilter       map[string]int `json:"rp_filter,omitempty"` // device -> 1 strict, 2 loose
+	ConntrackCount int            `json:"conntrack_count,omitempty"`
+	ConntrackMax   int            `json:"conntrack_max,omitempty"`
+	Sysctls        []string       `json:"sysctls,omitempty"` // settings known to drop packets
+	Have           []string       `json:"have"`              // capture, droptrace
+	Missing        []string       `json:"missing,omitempty"` // "droptrace: no bpftrace", ...
+}
+
+// Packet is one packet a capture saw.
+type Packet struct {
+	Time     float64
+	Dev      string
+	Dir      string // "In", "Out", or "" when the capture can't tell
+	Proto    string // tcp, udp, icmp
+	Src, Dst string
+	SrcPort  int
+	DstPort  int
+	Flags    string // TCP flags as tcpdump prints them: S, S., R., ...
+	Info     string // for ICMP, the message
+}
+
+// Drop is the kernel freeing one of our packets without delivering it.
+type Drop struct {
+	Src, Dst string
+	SrcPort  int
+	DstPort  int
+	Location string // the kernel function that dropped it
+	Reason   string // the drop reason (5.17+), "" when the kernel has none
+	// OtherNetns: dropped in another network namespace on the same
+	// machine (a container), not the one the node's commands run in.
+	OtherNetns bool
+}
+
+// Counter is a drop-related counter that moved while we probed.
+type Counter struct {
+	Kind     string // fw, stat, conntrack, tc, nic
+	Scope    string // firewall table, protocol, device
+	Name     string // rule, statistic, counter
+	Baseline int64  // how much it moved in the quiet window before
+	Delta    int64  // how much it moved while we probed
+}
+
+// Observed is everything an observation saw.
+type Observed struct {
+	Packets  []Packet
+	Drops    []Drop
+	Counters []Counter
+}
+
+// Observation is a running observation on one node.
+type Observation interface {
+	Inventory() Inventory
+	Stop(ctx context.Context) (Observed, error)
+}
+
 // Node is one machine.
 type Node interface {
 	Facts(ctx context.Context) (Facts, error)
@@ -159,6 +239,11 @@ type Node interface {
 	// MeasureBandwidth sends to a ServeBandwidth server for d and
 	// returns the bits per second that arrived.
 	MeasureBandwidth(ctx context.Context, ip string, port int, d time.Duration) (float64, error)
+	// Observe starts watching the node for packets of spec: which of them
+	// it sends and receives, which the kernel drops and where, and which
+	// drop counters they move. It only reads; nothing on the node changes.
+	// Needs privileges most nodes won't grant everyone: ErrUnsupported then.
+	Observe(ctx context.Context, spec ObserveSpec) (Observation, error)
 	Close() error
 }
 

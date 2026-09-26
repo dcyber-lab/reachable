@@ -20,6 +20,7 @@ type fake struct {
 	listenErr map[string]error     // "tcp/80" -> error from Listen
 	peer      map[string]string    // "tcp/80" -> source addr the listener sees; absent = nothing arrives
 	pmtu      node.PMTU
+	observe   *fakeObservation // nil: can't observe
 }
 
 func (f *fake) Facts(context.Context) (node.Facts, error) { return node.Facts{}, nil }
@@ -49,7 +50,21 @@ func (f *fake) ServeBandwidth(context.Context, int, time.Duration) (node.Stopper
 func (f *fake) MeasureBandwidth(context.Context, string, int, time.Duration) (float64, error) {
 	return 0, fmt.Errorf("%w: no iperf3", node.ErrUnsupported)
 }
+func (f *fake) Observe(context.Context, node.ObserveSpec) (node.Observation, error) {
+	if f.observe == nil {
+		return nil, fmt.Errorf("%w: needs root or passwordless sudo", node.ErrUnsupported)
+	}
+	return f.observe, nil
+}
 func (f *fake) Close() error { return nil }
+
+type fakeObservation struct {
+	inv node.Inventory
+	obs node.Observed
+}
+
+func (o *fakeObservation) Inventory() node.Inventory                   { return o.inv }
+func (o *fakeObservation) Stop(context.Context) (node.Observed, error) { return o.obs, nil }
 
 type fakeListener struct {
 	addr    string

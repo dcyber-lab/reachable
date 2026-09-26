@@ -32,6 +32,7 @@ jobs:
       - name: Install tools the probes use
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-server iproute2 iputils-ping iputils-tracepath iperf3 socat netcat-openbsd iptables
+          sudo apt-get install -y openssh-server iproute2 iputils-ping iputils-tracepath iperf3 socat netcat-openbsd iptables \
+            nftables tcpdump bpftrace ethtool
       - run: go build -o reachable .
       - run: sudo REACHABLE="$PWD/reachable" REQUIRE_IPV6=1 test/e2e/e2e.sh

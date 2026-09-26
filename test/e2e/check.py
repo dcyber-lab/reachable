@@ -6,6 +6,7 @@ Each EXPR is Python, evaluated with:
   st(i, n)    status of check n in direction i (0 = A->B, 1 = B->A), "" if absent
   code(i, n)  its code
   det(i, n)   its detail text
+  chk(i, n)   the whole check, as a dict ({} if absent)
   verdict(i)  the direction's verdict
 """
 import json
@@ -29,6 +30,7 @@ env = {
     "st": lambda i, n: find(i, n).get("status", ""),
     "code": lambda i, n: find(i, n).get("code", ""),
     "det": lambda i, n: find(i, n).get("detail", ""),
+    "chk": find,
     "verdict": lambda i: d["directions"][i]["verdict"],
 }
 failed = [e for e in exprs if not eval(e, env)]
