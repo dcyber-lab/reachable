@@ -84,7 +84,8 @@ func (s *Side) has(tool string) bool { return s.Facts.Tools[tool] }
 
 // Options control which checks run.
 type Options struct {
-	Ports          []int
+	Ports          []int // TCP
+	UDPPorts       []int
 	PingCount      int
 	ConnectTimeout int    // seconds
 	Trace          string // auto, always, never
@@ -134,7 +135,7 @@ func (p *prober) run() {
 // gotThrough reports whether anything at all reached dst at this address.
 func (p *prober) gotThrough() bool {
 	for _, c := range p.d.Checks {
-		if (c.Name == "icmp" || strings.HasPrefix(c.Name, "tcp/")) && c.Status == OK {
+		if (c.Name == "icmp" || strings.HasPrefix(c.Name, "tcp/") || strings.HasPrefix(c.Name, "udp/")) && c.Status == OK {
 			return true
 		}
 	}
@@ -178,9 +179,16 @@ func (p *prober) check() {
 	var open, blocked []string
 	for _, port := range p.opt.Ports {
 		if p.tcp(ip, port, route) {
-			open = append(open, strconv.Itoa(port))
+			open = append(open, fmt.Sprintf("tcp/%d", port))
 		} else {
-			blocked = append(blocked, strconv.Itoa(port))
+			blocked = append(blocked, fmt.Sprintf("tcp/%d", port))
+		}
+	}
+	for _, port := range p.opt.UDPPorts {
+		if ok, known := p.udp(ip, port, route); ok {
+			open = append(open, fmt.Sprintf("udp/%d", port))
+		} else if known {
+			blocked = append(blocked, fmt.Sprintf("udp/%d", port))
 		}
 	}
 	if ping != nil && ping.Received > 0 {
@@ -200,23 +208,24 @@ func (p *prober) check() {
 		for i := range d.Checks {
 			if d.Checks[i].Name == "icmp" {
 				d.Checks[i].Status = Warn
-				d.Checks[i].Detail = fmt.Sprintf("0/%d replies: ICMP is filtered (TCP gets through, so the host is up)", ping.Sent)
+				d.Checks[i].Detail = fmt.Sprintf("0/%d replies: ICMP is filtered (ports get through, so the host is up)", ping.Sent)
 			}
 		}
 	}
+	tested := len(open) + len(blocked)
 	switch {
-	case len(p.opt.Ports) == 0 && pinged:
-		d.Verdict, d.OK = "REACHABLE (ICMP only, no TCP ports tested)", true
-	case len(p.opt.Ports) == 0:
-		d.Verdict = "UNREACHABLE: no ping reply and no TCP ports tested"
+	case tested == 0 && pinged:
+		d.Verdict, d.OK = "REACHABLE (ICMP only, no ports tested)", true
+	case tested == 0:
+		d.Verdict = "UNREACHABLE: no ping reply and no ports tested"
 	case len(blocked) == 0:
-		d.Verdict, d.OK = "REACHABLE on tcp/"+strings.Join(open, ","), true
+		d.Verdict, d.OK = "REACHABLE on "+strings.Join(open, ","), true
 	case len(open) > 0:
-		d.Verdict = fmt.Sprintf("PARTIAL: tcp/%s open, tcp/%s blocked", strings.Join(open, ","), strings.Join(blocked, ","))
+		d.Verdict = fmt.Sprintf("PARTIAL: %s open, %s blocked", strings.Join(open, ","), strings.Join(blocked, ","))
 	case pinged:
-		d.Verdict = "BLOCKED: host answers ping but every tested TCP port is blocked"
+		d.Verdict = "BLOCKED: host answers ping but every tested port is blocked"
 	default:
-		d.Verdict = "UNREACHABLE: no ping reply and every tested TCP port is blocked"
+		d.Verdict = "UNREACHABLE: no ping reply and every tested port is blocked"
 	}
 }
 
@@ -326,31 +335,10 @@ func (p *prober) ping(ip string) *Ping {
 func (p *prober) tcp(ip string, port int, route Route) bool {
 	name := fmt.Sprintf("tcp/%d", port)
 	secs := p.opt.ConnectTimeout
-	mode, why := "none", ""
 
-	lst, err := p.dst.Host.Start(p.ctx, script("listen"), strconv.Itoa(port), strconv.Itoa(secs+5))
-	if err != nil {
-		why = err.Error()
-	} else {
+	lst, mode, why := p.listen("tcp", ip, port, secs+5)
+	if lst != nil {
 		defer lst.Stop()
-	wait:
-		for {
-			line, ok := lst.Next(15 * time.Second)
-			switch {
-			case !ok:
-				why = "listener did not start"
-				break wait
-			case line == "INUSE":
-				mode = "service"
-				break wait
-			case strings.HasPrefix(line, "READY"):
-				mode = "listener"
-				break wait
-			case strings.HasPrefix(line, "ERR "):
-				why = strings.TrimPrefix(line, "ERR ")
-				break wait
-			}
-		}
 	}
 
 	res, err := p.src.Host.Run(p.ctx, time.Duration(secs+15)*time.Second, script("connect"),
@@ -367,18 +355,7 @@ func (p *prober) tcp(ip string, port int, route Route) bool {
 		case "service":
 			p.d.add(name, OK, "open in %d ms (existing service on %s)", ms, p.dst.Label)
 		case "listener":
-			peer := ""
-			for peer == "" {
-				line, ok := lst.Next(3 * time.Second)
-				if !ok {
-					break
-				}
-				if strings.HasPrefix(line, "PEER ") {
-					peer = strings.TrimPrefix(line, "PEER ")
-				} else if line == "NOCONN" {
-					break
-				}
-			}
+			peer := waitPeer(lst, 3*time.Second)
 			switch {
 			case peer == "":
 				p.d.add(name, Warn, "connected in %d ms, but %s's listener never saw it: something in between "+
@@ -414,6 +391,105 @@ func (p *prober) tcp(ip string, port int, route Route) bool {
 		p.d.add(name, Fail, "connect failed: %s", msg)
 	}
 	return false
+}
+
+// listen starts listen.sh on dst. mode is "listener" when our own listener
+// is up, "service" when something already holds the port, and "none" (with
+// why) when neither; lst is nil only when ssh itself failed.
+func (p *prober) listen(proto, ip string, port, secs int) (lst *remote.Proc, mode, why string) {
+	fam := "4"
+	if strings.Contains(ip, ":") {
+		fam = "6"
+	}
+	lst, err := p.dst.Host.Start(p.ctx, script("listen"), proto, strconv.Itoa(port), strconv.Itoa(secs), fam)
+	if err != nil {
+		return nil, "none", err.Error()
+	}
+	for {
+		line, ok := lst.Next(15 * time.Second)
+		switch {
+		case !ok:
+			return lst, "none", "listener did not start"
+		case line == "INUSE":
+			return lst, "service", ""
+		case strings.HasPrefix(line, "READY"):
+			return lst, "listener", ""
+		case strings.HasPrefix(line, "ERR "):
+			return lst, "none", strings.TrimPrefix(line, "ERR ")
+		}
+	}
+}
+
+// waitPeer returns the address the listener saw the probe come from, "?"
+// if it got one but can't tell, or "" if nothing arrived.
+func waitPeer(lst *remote.Proc, timeout time.Duration) string {
+	for {
+		line, ok := lst.Next(timeout)
+		switch {
+		case !ok, line == "NOCONN":
+			return ""
+		case strings.HasPrefix(line, "PEER "):
+			return strings.TrimPrefix(line, "PEER ")
+		}
+	}
+}
+
+// udp checks one port. UDP has no handshake, so the only proof a datagram
+// arrived is our own listener on dst receiving it; its reply then tests the
+// way back. Returns open, and known=false when it could not tell.
+func (p *prober) udp(ip string, port int, route Route) (open, known bool) {
+	name := fmt.Sprintf("udp/%d", port)
+	secs := p.opt.ConnectTimeout
+	lst, mode, why := p.listen("udp", ip, port, secs+5)
+	if lst != nil {
+		defer lst.Stop()
+	}
+	switch mode {
+	case "service":
+		p.d.add(name, Skip, "something already holds udp/%d on %s; UDP has no handshake, "+
+			"so without our own listener there is nothing to check against", port, p.dst.Label)
+		return false, false
+	case "none":
+		p.d.add(name, Skip, "no listener on %s: %s", p.dst.Label, why)
+		return false, false
+	}
+
+	res, err := p.src.Host.Run(p.ctx, time.Duration(secs+15)*time.Second, script("udp"),
+		ip, strconv.Itoa(port), strconv.Itoa(secs))
+	if err != nil {
+		p.d.add(name, Fail, "%v", err)
+		return false, true
+	}
+	m := kv(res.Stdout)
+	reply, sendErr := first(m, "reply"), first(m, "err")
+	peer := waitPeer(lst, 2*time.Second)
+
+	switch {
+	case peer != "" && reply == "pong":
+		detail := fmt.Sprintf("datagram reached %s and the reply came back", p.dst.Label)
+		if peer != "?" && route.Src != "" && peer != route.Src {
+			detail += fmt.Sprintf("; %s sees %s as %s, not %s (SNAT in between)", p.dst.Label, p.src.Label, peer, route.Src)
+		}
+		p.d.add(name, OK, "%s", detail)
+	case peer != "":
+		p.d.add(name, Warn, "datagram reached %s, but its reply never got back to %s: "+
+			"return path filtered (stateful firewall without UDP tracking, asymmetric route?)", p.dst.Label, p.src.Label)
+	case strings.Contains(strings.ToLower(sendErr), "refused"):
+		p.d.add(name, Fail, "ICMP port-unreachable while %s was listening: a REJECT rule in between", p.dst.Label)
+		return false, true
+	case sendErr != "":
+		p.d.add(name, Fail, "send failed: %s", sendErr)
+		return false, true
+	case reply == "pong":
+		p.d.add(name, Warn, "got a reply, but %s's listener never saw the datagram: something in between "+
+			"answered for %s", p.dst.Label, p.dst.Label)
+		return false, true
+	default:
+		p.d.add(name, Fail, "datagrams never reached %s within %ds: dropped (firewall / security group / ACL)",
+			p.dst.Label, secs)
+		return false, true
+	}
+	return true, true
 }
 
 func (p *prober) pmtu(ip string, route Route) {

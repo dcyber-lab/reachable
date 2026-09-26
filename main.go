@@ -41,6 +41,7 @@ func main() {
 func run() int {
 	var (
 		ports     = flag.String("p", "22", "comma-separated TCP ports to test in both directions")
+		udpPorts  = flag.String("u", "", "comma-separated UDP ports to test in both directions")
 		aAddr     = flag.String("a-addr", "", "address B should dial to reach A (default: A's HostName from ssh -G)")
 		bAddr     = flag.String("b-addr", "", "address A should dial to reach B (default: B's HostName from ssh -G)")
 		oneWay    = flag.Bool("one-way", false, "only check A -> B")
@@ -72,6 +73,11 @@ func run() int {
 		return 2
 	}
 	portList, err := parsePorts(*ports)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reachable:", err)
+		return 2
+	}
+	udpList, err := parsePorts(*udpPorts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reachable:", err)
 		return 2
@@ -129,6 +135,7 @@ func run() int {
 
 	opt := probe.Options{
 		Ports:          portList,
+		UDPPorts:       udpList,
 		PingCount:      *count,
 		ConnectTimeout: *ctimeout,
 		Trace:          *trace,
