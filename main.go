@@ -75,7 +75,7 @@ func run() int {
 	flag.IntVar(&f.count, "c", 5, "pings per direction")
 	flag.DurationVar(&f.timeout, "t", 3*time.Second, "connect timeout per port")
 	flag.StringVar(&f.trace, "trace", "auto", "trace the path: auto (when something failed), always, never")
-	flag.BoolVar(&f.bw, "bw", true, "measure bandwidth (iperf3) when both machines can")
+	flag.BoolVar(&f.bw, "bw", false, "measure bandwidth with iperf3: fills the link for -iperf-time each way, so off unless asked")
 	flag.IntVar(&f.iperfPort, "iperf-port", 5201, "port for the bandwidth test")
 	flag.DurationVar(&f.iperfTime, "iperf-time", 3*time.Second, "length of each bandwidth test")
 	flag.BoolVar(&f.locate, "locate", true, "when a port fails, find where its packets die (needs root or passwordless sudo, tcpdump; bpftrace for more)")

@@ -55,7 +55,7 @@ data="-a-addr 10.9.0.1 -b-addr 10.9.0.2 -locate=false"
 scripts=$here/../../internal/node/shell/scripts
 
 reset
-scenario clean "$data -p 22,8080 -u 5353 -iperf-time 1s ha hb" \
+scenario clean "$data -p 22,8080 -u 5353 -bw -iperf-time 1s ha hb" \
 	'rc == 0' 'd["ok"]' \
 	'st(0, "tcp/22") == "ok" and "existing service" in det(0, "tcp/22")' \
 	'st(0, "tcp/8080") == "ok" and "temporary listener" in det(0, "tcp/8080")' \

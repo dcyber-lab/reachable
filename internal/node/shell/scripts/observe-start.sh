@@ -27,7 +27,8 @@ main() {
 		# The ICMP clauses catch unreachables about our port: a REJECT
 		# answered by a router or firewall on the way.
 		filter="$proto port $port or (icmp and icmp[0] == 3 and icmp[30:2] == $port) or (icmp6 and ip6[40] == 1 and ip6[90:2] == $port)"
-		$SUDO timeout "$life" tcpdump -l -nn -tt -i any -s 160 -c 2000 "$filter" >"$dir/cap" 2>"$dir/cap.err" </dev/null &
+		# -p: never promiscuous (-i any can't be anyway; this keeps it so).
+		$SUDO timeout "$life" tcpdump -p -l -nn -tt -i any -s 160 -c 2000 "$filter" >"$dir/cap" 2>"$dir/cap.err" </dev/null &
 		echo $! >>"$dir/pids"
 		wait_for "$dir/cap.err" "listening on" $! && echo "have=capture" ||
 			echo "missing=capture: tcpdump did not start: $(head -n1 "$dir/cap.err")"

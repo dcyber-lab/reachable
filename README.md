@@ -76,7 +76,7 @@ A and B are written `BACKEND://TARGET`:
 | `-c` | 5 | pings per direction |
 | `-t` | 3s | connect timeout per port |
 | `-trace` | `auto` | tracepath/traceroute: `auto` (only when something failed), `always`, `never` |
-| `-bw` | on | iperf3 bandwidth, when both machines can |
+| `-bw` | off | iperf3 bandwidth, when both machines can. It fills the link for `-iperf-time` each way, so only ask for it where that is acceptable |
 | `-iperf-port` / `-iperf-time` | 5201 / 3s | |
 | `-ssh` | | extra ssh args, e.g. `"-p 2222 -i ~/.ssh/key"` |
 | `-locate` | on | when a port fails, find where its packets die (see below) |
@@ -170,8 +170,8 @@ detail says why) or `<name>.error`.
   `pmtu.reported` (smaller than the interface MTU, but a hop says so and
   PMTUD works), `pmtu.blackhole` (bigger packets vanish silently: the
   classic "ssh works, scp hangs"), `pmtu.skipped` (ICMP is filtered).
-- **bw** — one iperf3 TCP run per direction, on `-iperf-port`, one
-  direction at a time. `bw.ok`, `bw.skipped` (ports blocked).
+- **bw** — with `-bw` only: one iperf3 TCP run per direction, on
+  `-iperf-port`, one direction at a time. `bw.ok`, `bw.skipped` (ports blocked).
 - **trace** — hops from the source, by default only when something failed.
   `trace.hops`, `trace.silent`.
 - **hint** — `hint.other_addrs`: nothing got through; the destination's
@@ -244,6 +244,26 @@ lives in the hypervisor; the VPC's flow logs are where to confirm it.
 
 The drop trace sees every network namespace on a machine; drops in other
 namespaces (containers) are listed as such and not blamed on the machine.
+
+## What it costs the machines
+
+Checking a port is a handful of packets: a few TCP connects or UDP
+datagrams, five pings, a short-lived listener, a few DF pings for the path
+MTU. Only `-bw` loads the network, which is why it is off by default.
+
+`-locate` runs only for a port that failed, for about ten seconds, and
+changes nothing on the machines. What it costs while it runs, measured on
+a 4-core VM (kernel 6.18):
+
+| | cost |
+|---|---|
+| packet capture (tcpdump, filtered to the port) | the kernel runs the filter on every packet on every interface: about 30 ns per packet. At 1.26 Mpps, the most this VM would take, it lowered what B received by about 4%; below saturation it is CPU time only. Never promiscuous. |
+| drop trace (bpftrace on `skb:kfree_skb`) | runs only when the kernel drops a packet, not for packets delivered or forwarded: 117 ns per drop, measured over 1.19 million drops. On kernels older than about 5.x, `kfree_skb` is also called for some ordinary frees, so it runs more often there. |
+| starting bpftrace | it compiles the program on the machine: 2.6 s, about 1 s of CPU, 107 MB of memory at peak. |
+| counter snapshots, three of them | `iptables-save`, `nft list ruleset`, `tc -s qdisc`, `ethtool -S`, `/proc` reads. Cheap on most machines; on a node with tens of thousands of iptables rules (kube-proxy) each `iptables-save` takes seconds of CPU. `ethtool -S` briefly takes the kernel's network configuration lock. |
+
+The capture and the trace are bounded by a timeout and killed when locate
+is done, even if reachable itself dies.
 
 ## How it's built
 
