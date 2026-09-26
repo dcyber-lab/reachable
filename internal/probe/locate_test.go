@@ -126,7 +126,7 @@ func TestAnalyze(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			f := analyze(node.TCP, 80, "10.0.0.2", c.a, c.b, c.dials)
+			f := analyze(node.TCP, 80, "10.0.0.2", []string{"10.0.0.1"}, c.a, c.b, c.dials)
 			if f.where != c.where || f.mechanism != c.mech || f.confidence != c.conf || !strings.Contains(f.culprit, c.culprit) {
 				t.Errorf("got where=%s mechanism=%s confidence=%s culprit=%q\nwant where=%s mechanism=%s confidence=%s culprit~%q\nevidence:\n  %s",
 					f.where, f.mechanism, f.confidence, f.culprit, c.where, c.mech, c.conf, c.culprit, strings.Join(f.evidence, "\n  "))
@@ -165,5 +165,94 @@ func TestLocateWiring(t *testing.T) {
 		&fake{observe: b, peer: map[string]string{"tcp/80": "10.0.0.1"}}, Options{TCPPorts: []int{80}, Locate: true})
 	if _, ok := codes(d)["locate tcp/80"]; ok {
 		t.Errorf("located an open port: %v", codes(d))
+	}
+}
+
+func TestCouldMatch(t *testing.T) {
+	cases := []struct {
+		rule  string
+		proto node.Proto
+		port  int
+		want  bool
+	}{
+		{"-A INPUT -i eth0 -p tcp -m tcp --dport 7777 -j DROP", node.TCP, 7777, true},
+		{"-A INPUT -i eth0 -p udp -m udp --dport 9999 -j DROP", node.TCP, 7777, false},
+		{"-A INPUT -p tcp -m tcp --dport 22 -j DROP", node.TCP, 7777, false},
+		{"-A INPUT -p tcp -m multiport --dports 80,443,7000:8000 -j DROP", node.TCP, 7777, true},
+		{"-A INPUT -p tcp -m tcp ! --dport 22 -j DROP", node.TCP, 7777, true},
+		{"-A INPUT -s 10.0.0.0/8 -j DROP", node.TCP, 7777, true},
+		{"-A INPUT -p tcp -m tcp --sport 7777 -j DROP", node.TCP, 7777, true},
+		{"policy INPUT DROP", node.UDP, 53, true},
+		{`iifname "eth0" tcp dport 7777 counter drop`, node.TCP, 7777, true},
+		{`iifname "eth0" udp dport 9999 counter drop`, node.TCP, 7777, false},
+		{`tcp dport { 22, 80 } counter drop`, node.TCP, 7777, false},
+		{`tcp dport 7000-8000 counter drop`, node.TCP, 7777, true},
+		{`meta l4proto udp counter drop`, node.TCP, 7777, false},
+	}
+	for _, c := range cases {
+		if got := couldMatch(c.rule, c.proto, c.port); got != c.want {
+			t.Errorf("couldMatch(%q, %s/%d) = %v, want %v", c.rule, c.proto, c.port, got, c.want)
+		}
+	}
+}
+
+// What a busy machine looks like: counters moving all the time, and other
+// clients on the port.
+func TestAnalyzeNoise(t *testing.T) {
+	sent := []node.Packet{syn("Out"), syn("Out"), syn("Out")}
+	arrived := []node.Packet{syn("In"), syn("In"), syn("In")}
+	windows := func(o node.Observed) node.Observed {
+		o.BaselineSecs, o.ProbeSecs = 2, 9
+		return o
+	}
+	b := func(pk []node.Packet, ctrs []node.Counter) side {
+		s := obsSide("B", capture, pk, nil, ctrs)
+		s.obs = windows(s.obs)
+		return s
+	}
+
+	// A steady drop elsewhere moves 4.5x in a window 4.5x as long: noise,
+	// however big; the rp_filter counter matching our 3 packets is it.
+	f := analyze(node.TCP, 80, "10.0.0.2", []string{"10.0.0.1"}, obsSide("A", capture, sent, nil, nil), b(arrived, []node.Counter{
+		{Kind: "nic", Scope: "eth0", Name: "rx_dropped", Baseline: 150, Delta: 690},
+		{Kind: "stat", Scope: "TcpExt", Name: "IPReversePathFilter", Delta: 3},
+	}), nil)
+	if f.mechanism != "rp_filter" {
+		t.Errorf("steady noise: got %s (%s)\n  %s", f.mechanism, f.culprit, strings.Join(f.evidence, "\n  "))
+	}
+
+	// A rule that can't match our packets is never the culprit.
+	f = analyze(node.TCP, 80, "10.0.0.2", []string{"10.0.0.1"}, obsSide("A", capture, sent, nil, nil), b(arrived, []node.Counter{
+		{Kind: "fw", Scope: "iptables-save filter", Name: "-A INPUT -p udp -m udp --dport 9999 -j DROP", Baseline: 10, Delta: 500},
+		{Kind: "stat", Scope: "TcpExt", Name: "IPReversePathFilter", Delta: 3},
+	}), nil)
+	if f.mechanism != "rp_filter" {
+		t.Errorf("unrelated rule: got %s (%s)", f.mechanism, f.culprit)
+	}
+
+	// Of two counters that moved, the one that moved by our packet count.
+	f = analyze(node.TCP, 80, "10.0.0.2", []string{"10.0.0.1"}, obsSide("A", capture, sent, nil, nil), b(arrived, []node.Counter{
+		{Kind: "fw", Scope: "iptables-save filter", Name: "-A INPUT -s 10.0.0.0/8 -j DROP", Delta: 40},
+		{Kind: "tc", Scope: "eth0", Name: "clsact", Delta: 3},
+	}), nil)
+	if f.mechanism != "tc" {
+		t.Errorf("closest to our count: got %s (%s)", f.mechanism, f.culprit)
+	}
+
+	// Other clients reach the busy port; our probes never did.
+	other := node.Packet{Dir: "In", Proto: "tcp", Src: "10.0.0.77", SrcPort: 5555, Dst: "10.0.0.2", DstPort: 80, Flags: "S"}
+	f = analyze(node.TCP, 80, "10.0.0.2", []string{"10.0.0.1"}, obsSide("A", capture, sent, nil, nil),
+		b([]node.Packet{other, synack("Out")}, nil), nil)
+	if f.where != wherePath {
+		t.Errorf("other clients taken for ours: %s %s", f.where, f.mechanism)
+	}
+
+	// Behind SNAT: as many packets as were sent, from an address that
+	// isn't the source's. Those are ours.
+	snat := func(p node.Packet) node.Packet { p.Src = "192.0.2.9"; return p }
+	f = analyze(node.TCP, 80, "10.0.0.2", []string{"10.0.0.1"}, obsSide("A", capture, sent, nil, nil),
+		b([]node.Packet{snat(syn("In")), snat(syn("In")), snat(syn("In"))}, []node.Counter{{Kind: "fw", Scope: "iptables-save filter", Name: "-A INPUT -p tcp --dport 80 -j DROP", Delta: 3}}), nil)
+	if f.where != whereDstIngress || f.mechanism != "netfilter" {
+		t.Errorf("behind SNAT: %s %s", f.where, f.mechanism)
 	}
 }

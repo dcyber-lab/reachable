@@ -51,7 +51,7 @@ func TestParseObserve(t *testing.T) {
 		t.Fatalf("not root: %v", err)
 	}
 
-	o, err := parseObserveStop("window=2 2\n" +
+	o, err := parseObserveStop("window=2.10 4.35\n" +
 		"ctr=fw\tiptables-save filter\t-A INPUT -p tcp -m tcp --dport 8080 -j DROP\t0\t6\n" +
 		"ctr=tc\teth0\tclsact\t1\t7\n" +
 		"pkt=1.0 eth0 In IP 10.0.0.1.4000 > 10.0.0.2.8080: Flags [S], length 0\n" +
@@ -59,6 +59,9 @@ func TestParseObserve(t *testing.T) {
 		"drop=10.0.0.1 4001 10.0.0.2 8080 netif_receive_generic_xdp - other\n")
 	if err != nil || len(o.Counters) != 2 || len(o.Packets) != 1 || len(o.Drops) != 2 {
 		t.Fatalf("stop: %v %+v", err, o)
+	}
+	if o.BaselineSecs != 2.1 || o.ProbeSecs != 4.35 {
+		t.Errorf("windows %v %v", o.BaselineSecs, o.ProbeSecs)
 	}
 	if o.Counters[1] != (node.Counter{Kind: "tc", Scope: "eth0", Name: "clsact", Baseline: 1, Delta: 7}) {
 		t.Errorf("counter %+v", o.Counters[1])

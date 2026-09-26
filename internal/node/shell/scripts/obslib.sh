@@ -13,6 +13,12 @@ as_root() {
 	return 1
 }
 
+# uptime_now prints seconds since boot to the hundredth: /proc/uptime works
+# everywhere, where date +%N doesn't (busybox).
+uptime_now() {
+	cut -d' ' -f1 /proc/uptime
+}
+
 tracefs() {
 	for t in /sys/kernel/tracing /sys/kernel/debug/tracing; do
 		if $SUDO test -r "$t/events/skb/kfree_skb/format"; then

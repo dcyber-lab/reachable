@@ -2,8 +2,10 @@ package probe
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +52,12 @@ type side struct {
 	why   string
 	inv   node.Inventory
 	obs   node.Observed
+
+	// Set by analyze: what the probes were, and how many of ours this
+	// side's capture saw (0 when unknown), to weigh counters against.
+	proto node.Proto
+	port  int
+	ours  int
 }
 
 func (s side) has(what string) bool {
@@ -125,7 +133,11 @@ func (p *prober) locate(proto node.Proto, ip string, port int) {
 		lst.Close()
 	}
 
-	f := analyze(proto, port, ip, *sides[0], *sides[1], dials)
+	var srcAddrs []string
+	for _, a := range p.src.Facts.Addrs {
+		srcAddrs = append(srcAddrs, a.IP)
+	}
+	f := analyze(proto, port, ip, srcAddrs, *sides[0], *sides[1], dials)
 	st := Fail
 	if f.where == whereUnknown {
 		st = Info
@@ -158,11 +170,16 @@ func describe(f finding, src, dst string) string {
 }
 
 // analyze reads two observations of the same burst against each other.
-func analyze(proto node.Proto, port int, dstIP string, a, b side, dials []node.Dial) finding {
+// srcAddrs are the source's own addresses, to pick its probes out of
+// whatever else the destination's port sees.
+func analyze(proto node.Proto, port int, dstIP string, srcAddrs []string, a, b side, dials []node.Dial) finding {
 	var ev []string
 	add := func(format string, args ...any) { ev = append(ev, fmt.Sprintf(format, args...)) }
 	fwd := func(p node.Packet) bool { return p.Proto == string(proto) && p.DstPort == port }
 	rev := func(p node.Packet) bool { return p.Proto == string(proto) && p.SrcPort == port }
+	fromSrc := func(p node.Packet) bool { return fwd(p) && (len(srcAddrs) == 0 || slices.Contains(srcAddrs, p.Src)) }
+	toSrc := func(p node.Packet) bool { return rev(p) && (len(srcAddrs) == 0 || slices.Contains(srcAddrs, p.Dst)) }
+	a.proto, a.port, b.proto, b.port = proto, port, proto, port
 	count := func(s side, match func(node.Packet) bool) int {
 		n := 0
 		for _, p := range s.obs.Packets {
@@ -195,7 +212,21 @@ func analyze(proto node.Proto, port int, dstIP string, a, b side, dials []node.D
 	}
 
 	aCap, bCap := a.ok && a.has("capture"), b.ok && b.has("capture")
-	aOut, aIn, bIn, bOut := count(a, fwd), count(a, rev), count(b, fwd), count(b, rev)
+	aOut, aIn, bIn, bOut := count(a, fwd), count(a, rev), count(b, fromSrc), count(b, toSrc)
+	// A busy port sees other clients too, so only packets from the
+	// source's own addresses count. With none, SNAT in between would look
+	// the same as other clients: take them for ours only if there are
+	// about as many as the source sent.
+	if all := count(b, fwd); bIn == 0 && all > 0 {
+		if aCap && aOut > 0 && all*2 >= aOut && all <= aOut*2 {
+			add("%s's capture: %d packet(s) to the port, none from %s's own addresses; about as many as %s sent, so taken as ours behind SNAT",
+				b.label, all, a.label, a.label)
+			bIn, bOut = all, count(b, rev)
+		} else {
+			add("%s's capture: %d packet(s) to the port from other addresses, not counted as ours (other clients, or SNAT)", b.label, all)
+		}
+	}
+	a.ours, b.ours = aOut, bIn
 	if aCap {
 		add("%s's capture: %d probe packet(s) out, %d reply packet(s) in", a.label, aOut, aIn)
 	}
@@ -379,8 +410,7 @@ func traced(s side, match func(node.Drop) bool, where string, ev []string) (find
 		for _, c := range moved(s) {
 			if counterMechanism(c) == mech {
 				f.culprit += "; " + counterCulprit(c)
-				f.evidence = append(f.evidence, fmt.Sprintf("%s: %s %s %s moved by %d (%d in the quiet window before)",
-					s.label, c.Kind, c.Scope, c.Name, c.Delta, c.Baseline))
+				f.evidence = append(f.evidence, movedLine(s, c))
 				return f, true
 			}
 		}
@@ -421,8 +451,7 @@ func mechanismOf(d node.Drop) string {
 func blame(s side, strong bool, where string, ev []string, mechanisms ...string) finding {
 	f := finding{where: where, evidence: ev}
 	for _, c := range moved(s) {
-		f.evidence = append(f.evidence, fmt.Sprintf("%s: %s %s %s moved by %d (%d in the quiet window before)",
-			s.label, c.Kind, c.Scope, c.Name, c.Delta, c.Baseline))
+		f.evidence = append(f.evidence, movedLine(s, c))
 		mech := counterMechanism(c)
 		if f.mechanism != "" || mech == "" || (len(mechanisms) > 0 && !slices.Contains(mechanisms, mech)) {
 			continue
@@ -436,17 +465,115 @@ func blame(s side, strong bool, where string, ev []string, mechanisms ...string)
 }
 
 // moved returns s's counters that moved with our probes rather than with
-// background traffic: more than twice the quiet window's movement.
+// the machine's own traffic, most likely first.
+//
+// A counter's quiet-window movement, scaled to the probe window's length,
+// is what background traffic alone would have added; only what it moved
+// beyond that counts, and only when that is more than a couple of packets
+// and more than half again the background. A firewall rule whose protocol
+// or port can't be ours is left out however it moved. What remains is
+// ordered by how close its extra movement is to the number of our packets
+// the capture saw.
 func moved(s side) []node.Counter {
-	var out []node.Counter
+	type cand struct {
+		c      node.Counter
+		excess float64
+	}
+	var cs []cand
 	for _, c := range s.obs.Counters {
-		if c.Delta > 2*c.Baseline {
-			out = append(out, c)
+		expected := expectedDelta(s.obs, c)
+		excess := float64(c.Delta) - expected
+		if excess < 2 || excess <= expected/2 {
+			continue
+		}
+		if c.Kind == "fw" && s.port != 0 && !couldMatch(c.Name, s.proto, s.port) {
+			continue
+		}
+		cs = append(cs, cand{c, excess})
+	}
+	sort.SliceStable(cs, func(i, j int) bool {
+		if s.ours > 0 {
+			di, dj := math.Abs(cs[i].excess-float64(s.ours)), math.Abs(cs[j].excess-float64(s.ours))
+			if di != dj {
+				return di < dj
+			}
+		}
+		// Firewall rules first among equals: they name the exact culprit.
+		return cs[i].c.Kind == "fw" && cs[j].c.Kind != "fw"
+	})
+	out := make([]node.Counter, len(cs))
+	for i, c := range cs {
+		out[i] = c.c
+	}
+	return out
+}
+
+// expectedDelta is how much c would have moved in the probe window from
+// background traffic alone, going by the quiet window.
+func expectedDelta(o node.Observed, c node.Counter) float64 {
+	if o.BaselineSecs > 0 && o.ProbeSecs > 0 {
+		return float64(c.Baseline) * o.ProbeSecs / o.BaselineSecs
+	}
+	return 2 * float64(c.Baseline) // window lengths unknown: assume twice as long
+}
+
+func movedLine(s side, c node.Counter) string {
+	return fmt.Sprintf("%s: %s %s %s moved by %d (%.0f expected from the quiet window)",
+		s.label, c.Kind, c.Scope, c.Name, c.Delta, expectedDelta(s.obs, c))
+}
+
+// couldMatch reports whether a firewall rule could apply to our packets,
+// going by the protocol and ports it names (iptables-save or nft syntax).
+// A rule that names none could match anything.
+func couldMatch(rule string, proto node.Proto, port int) bool {
+	f := strings.Fields(strings.NewReplacer("{", " ", "}", " ", ",", " ").Replace(rule))
+	protos := map[string]bool{"tcp": true, "udp": true, "icmp": true, "icmpv6": true, "sctp": true, "udplite": true, "dccp": true}
+	var named []string
+	portSpec, portOK := false, false
+	for i := 0; i < len(f); i++ {
+		t := f[i]
+		negated := i > 0 && (f[i-1] == "!" || f[i-1] == "!=")
+		switch {
+		case (t == "-p" || t == "--protocol" || t == "l4proto" || t == "protocol") && i+1 < len(f):
+			if !negated && !(i+1 < len(f) && f[i+1] == "!=") {
+				named = append(named, f[i+1])
+			}
+		case protos[t] && i+1 < len(f) && (f[i+1] == "dport" || f[i+1] == "sport"):
+			named = append(named, t) // nft: "tcp dport 80"
+		case t == "--dport" || t == "--sport" || t == "--dports" || t == "--sports" || t == "dport" || t == "sport":
+			if negated || (i+1 < len(f) && (f[i+1] == "!=" || f[i+1] == "!")) {
+				continue
+			}
+			for j := i + 1; j < len(f) && isPortSpec(f[j]); j++ {
+				portSpec = true
+				if portIn(f[j], port) {
+					portOK = true
+				}
+			}
 		}
 	}
-	// Firewall rules first: they name the exact culprit.
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Kind == "fw" && out[j].Kind != "fw" })
-	return out
+	if len(named) > 0 && !slices.Contains(named, string(proto)) {
+		return false
+	}
+	return !portSpec || portOK
+}
+
+func isPortSpec(t string) bool {
+	return t != "" && strings.Trim(t, "0123456789:-") == ""
+}
+
+// portIn reports whether port is t: "80", "1000:2000" or "1000-2000".
+func portIn(t string, port int) bool {
+	lo, hi, isRange := strings.Cut(strings.ReplaceAll(t, "-", ":"), ":")
+	l, err := strconv.Atoi(lo)
+	if err != nil {
+		return false
+	}
+	if !isRange {
+		return l == port
+	}
+	h, err := strconv.Atoi(hi)
+	return err == nil && l <= port && port <= h
 }
 
 func counterMechanism(c node.Counter) string {

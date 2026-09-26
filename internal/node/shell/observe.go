@@ -34,20 +34,19 @@ func (n *Node) Observe(ctx context.Context, spec node.ObserveSpec) (node.Observa
 	if err != nil {
 		return nil, err
 	}
-	return &observation{n: n, dir: dir, baseline: secs(spec.Baseline), inv: inv}, nil
+	return &observation{n: n, dir: dir, inv: inv}, nil
 }
 
 type observation struct {
-	n        *Node
-	dir      string
-	baseline string
-	inv      node.Inventory
+	n   *Node
+	dir string
+	inv node.Inventory
 }
 
 func (o *observation) Inventory() node.Inventory { return o.inv }
 
 func (o *observation) Stop(ctx context.Context) (node.Observed, error) {
-	args := []string{o.dir, o.baseline}
+	args := []string{o.dir}
 	if err := checkArgs(args); err != nil {
 		return node.Observed{}, err
 	}
@@ -99,6 +98,10 @@ func parseObserveStop(out string) (node.Observed, error) {
 		return node.Observed{}, fmt.Errorf("%s", e)
 	}
 	var o node.Observed
+	if w := strings.Fields(first(m, "window")); len(w) == 2 {
+		o.BaselineSecs, _ = strconv.ParseFloat(w[0], 64)
+		o.ProbeSecs, _ = strconv.ParseFloat(w[1], 64)
+	}
 	for _, c := range m["ctr"] {
 		f := strings.Split(c, "\t")
 		if len(f) != 5 {

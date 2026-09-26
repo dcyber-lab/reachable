@@ -200,15 +200,19 @@ type Counter struct {
 	Kind     string // fw, stat, conntrack, tc, nic
 	Scope    string // firewall table, protocol, device
 	Name     string // rule, statistic, counter
-	Baseline int64  // how much it moved in the quiet window before
-	Delta    int64  // how much it moved while we probed
+	Baseline int64  // how much it moved in the quiet window (Observed.BaselineSecs)
+	Delta    int64  // how much it moved while we probed (Observed.ProbeSecs)
 }
 
 // Observed is everything an observation saw.
 type Observed struct {
-	Packets  []Packet
-	Drops    []Drop
-	Counters []Counter
+	// How long the quiet window and the probe window lasted, to compare
+	// counters' movement in the two at the same rate.
+	BaselineSecs float64
+	ProbeSecs    float64
+	Packets      []Packet
+	Drops        []Drop
+	Counters     []Counter
 }
 
 // Observation is a running observation on one node.

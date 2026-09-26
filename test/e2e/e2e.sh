@@ -231,6 +231,26 @@ lscenario locate-no-trace-iptables dst_ingress netfilter counted "--dport 7777 -
 reset
 ip -n hb link set dev dB xdpgeneric pinned "$bpffs/xdp_drop"
 lscenario locate-no-trace-xdp unknown xdp_or_network inferred "XDP on B's dB"
+# A busy machine: a steady flood dropped by an unrelated rule on B while
+# rp_filter drops our probes. The long connect timeout makes the probe
+# window several times the quiet one, so the noise has to be scaled away
+# rather than out-grown.
+reset
+ns ha ip addr add 10.77.0.1/32 dev dA
+ns ha iptables -t nat -A POSTROUTING -o dA -p tcp --dport 7777 -j SNAT --to-source 10.77.0.1
+ns hb ip route add 10.77.0.0/24 via 10.8.2.1 dev mgmt
+ns hb sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.dB.rp_filter=1
+ns hb iptables -A INPUT -i dB -p udp --dport 9999 -j DROP
+# Not through ns(): backgrounding a function would leave $! the subshell's
+# pid, and the flood would outlive the kill.
+ip netns exec ha bash -c 'while :; do echo x >/dev/udp/10.9.0.2/9999; sleep 0.01; done' &
+noise=$!
+scenario locate-noisy "$data -locate=true -one-way -p 7777 -t 8s -bw=false -trace never ha hb" \
+	'rc == 1' 'chk(0, "locate tcp/7777").get("mechanism") == "rp_filter"' \
+	'"9999" not in chk(0, "locate tcp/7777").get("culprit", "")'
+kill "$noise"
+wait "$noise" 2>/dev/null
+
 for n in ha hb; do
 	nsenter -t "$(cat "$work/sshd-$n.pid")" -m umount "$(command -v bpftrace)"
 done

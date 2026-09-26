@@ -20,6 +20,7 @@ main() {
 	stat -L -c %i /proc/self/ns/net >"$dir/netns" 2>/dev/null
 	inventory
 	snap "$dir/s0"
+	uptime_now >"$dir/t0"
 	: >"$dir/pids"
 
 	if command -v tcpdump >/dev/null 2>&1; then
@@ -38,7 +39,7 @@ main() {
 
 	sleep "$base"
 	snap "$dir/s1"
-	date +%s >"$dir/t1"
+	uptime_now >"$dir/t1"
 	echo "ready=1"
 }
 

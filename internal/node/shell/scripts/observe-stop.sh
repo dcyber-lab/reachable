@@ -1,5 +1,5 @@
-# observe-stop.sh DIR BASELINE -- end an observation started by
-# observe-start.sh and report what it saw:
+# observe-stop.sh DIR -- end an observation started by observe-start.sh
+# and report what it saw:
 #   window=BASELINE PROBE         seconds each counter window lasted
 #   ctr=KIND<TAB>SCOPE<TAB>NAME<TAB>BASELINE-DELTA<TAB>PROBE-DELTA
 #                                 every counter that moved while we probed
@@ -9,13 +9,14 @@
 #                                 another network namespace (a container)
 main() {
 	export LC_ALL=C PATH="$PATH:/usr/sbin:/sbin"
-	dir=$1 base=$2
+	dir=$1
 	as_root || { echo "err=needs root or passwordless sudo"; return 0; }
 	case $dir in /tmp/reachable-obs.*) ;; *) echo "err=not an observation: $dir"; return 0 ;; esac
 	[ -d "$dir" ] || { echo "err=observation $dir is gone"; return 0; }
 
 	snap "$dir/s2"
-	echo "window=$base $(( $(date +%s) - $(cat "$dir/t1" 2>/dev/null || date +%s) ))"
+	uptime_now >"$dir/t2"
+	echo "window=$(cat "$dir/t0" "$dir/t1" "$dir/t2" | awk 'NR == 1 { a = $1 } NR == 2 { b = $1 } NR == 3 { c = $1 } END { printf "%.2f %.2f", b - a, c - b }')"
 	# Let the last packets land in the capture and the trace, then stop both.
 	sleep 0.5
 	for p in $(cat "$dir/pids"); do $SUDO kill "$p" 2>/dev/null; done
