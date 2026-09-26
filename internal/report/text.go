@@ -4,7 +4,6 @@ package report
 import (
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/dcyber-lab/reachable/internal/probe"
@@ -37,21 +36,16 @@ func (p Printer) status(st probe.Status) string {
 	}
 }
 
-// Side prints what we learned about one server.
+// Side prints what we learned about one machine.
 func (p Printer) Side(s *probe.Side) {
 	f := s.Facts
-	var tools []string
-	for t := range f.Tools {
-		tools = append(tools, t)
-	}
-	sort.Strings(tools)
 	var addrs []string
 	for _, a := range f.Addrs {
 		addrs = append(addrs, a.IP+"@"+a.Dev)
 	}
 	fmt.Fprintf(p.W, "%s  %s  %s@%s  %s %s\n", p.paint("1", s.Label), s.Target, f.User, f.Hostname, f.Arch, f.Kernel)
 	fmt.Fprintf(p.W, "   dialed as %s; addrs: %s\n", s.Addr, orNone(addrs))
-	fmt.Fprintf(p.W, "   tools: %s\n", orNone(tools))
+	fmt.Fprintf(p.W, "   can use: %s\n", orNone(f.Capabilities))
 }
 
 func orNone(xs []string) string {

@@ -1,10 +1,11 @@
 # listen.sh PROTO PORT SECONDS FAMILY -- wait for one TCP connection or one
 # UDP probe datagram on PORT. PROTO is tcp or udp, FAMILY 4 or 6.
-# Prints one of: INUSE, ERR <why>, READY <tool>; after READY one of
+# Prints PID <pid> first, then one of: INUSE, ERR <why>, READY <tool>; after READY one of
 # PEER <addr> (addr is "?" when the tool can't tell), NOCONN.
 # UDP probes are answered with "pong" so the sender can check the way back.
 main() {
 	export LC_ALL=C PATH="$PATH:/usr/sbin:/sbin"
+	echo "PID $$" # for kill.sh
 	proto=$1 port=$2 secs=$3 fam=$4
 	if command -v ss >/dev/null 2>&1; then
 		flag=-Hltn

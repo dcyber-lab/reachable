@@ -8,7 +8,7 @@ test:
 	go test ./...
 
 lint:
-	shellcheck -s bash -S warning internal/probe/scripts/*.sh
+	shellcheck -s bash -S warning internal/node/shell/scripts/*.sh
 	shellcheck -S warning test/e2e/*.sh
 
 # Needs root: builds network namespaces. See test/e2e/e2e.sh.

@@ -4,6 +4,7 @@ Each EXPR is Python, evaluated with:
   rc          exit status of the run
   d           the parsed JSON
   st(i, n)    status of check n in direction i (0 = A->B, 1 = B->A), "" if absent
+  code(i, n)  its code
   det(i, n)   its detail text
   verdict(i)  the direction's verdict
 """
@@ -26,6 +27,7 @@ env = {
     "rc": rc,
     "d": d,
     "st": lambda i, n: find(i, n).get("status", ""),
+    "code": lambda i, n: find(i, n).get("code", ""),
     "det": lambda i, n: find(i, n).get("detail", ""),
     "verdict": lambda i: d["directions"][i]["verdict"],
 }

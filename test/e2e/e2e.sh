@@ -30,13 +30,13 @@ reset() {
 }
 
 fails=0
-# scenario NAME "reachable args" EXPR... -- run, then assert
+# scenario NAME "reachable args, machines included" EXPR... -- run, then assert
 scenario() {
 	local name=$1 args=$2
 	shift 2
 	echo "--- $name"
 	# shellcheck disable=SC2086 # args is a word list on purpose
-	"$bin" -json -ssh "-F $work/ssh_config" $args ha hb >"$work/$name.json" 2>"$work/$name.err"
+	"$bin" -json -ssh "-F $work/ssh_config" $args >"$work/$name.json" 2>"$work/$name.err" </dev/null
 	local rc=$?
 	if ! python3 "$here/check.py" "$work/$name.json" "$rc" "$@"; then
 		fails=$((fails + 1))
@@ -45,9 +45,10 @@ scenario() {
 	fi
 }
 data="-a-addr 10.9.0.1 -b-addr 10.9.0.2"
+scripts=$here/../../internal/node/shell/scripts
 
 reset
-scenario clean "$data -p 22,8080 -u 5353 -iperf-time 1" \
+scenario clean "$data -p 22,8080 -u 5353 -iperf-time 1s ha hb" \
 	'rc == 0' 'd["ok"]' \
 	'st(0, "tcp/22") == "ok" and "existing service" in det(0, "tcp/22")' \
 	'st(0, "tcp/8080") == "ok" and "temporary listener" in det(0, "tcp/8080")' \
@@ -70,45 +71,73 @@ ns hb iptables -A INPUT -i dB -p udp --dport 5353 -j DROP
 ns hb iptables -A INPUT -i dB -p udp --dport 5454 -j REJECT --reject-with icmp-port-unreachable
 ns ha iptables -A INPUT -i dA -p udp --sport 5555 -j DROP # B's replies
 ns hb iptables -A INPUT -i dB -p icmp --icmp-type echo-request -j DROP
-scenario faults "$data -p 22,6060,7070,8080,9090 -u 5353,5454,5555,6061 -bw=false -trace never" \
+scenario faults "$data -p 22,6060,7070,8080,9090 -u 5353,5454,5555,6061 -bw=false -trace never ha hb" \
 	'rc == 1' 'not d["ok"]' \
 	'st(0, "icmp") == "warn" and "ICMP is filtered" in det(0, "icmp")' \
 	'st(0, "tcp/22") == "ok"' \
-	'st(0, "tcp/6060") == "ok" and "SNAT" in det(0, "tcp/6060") and "10.9.0.11" in det(0, "tcp/6060")' \
-	'st(0, "tcp/7070") == "warn" and "never saw it" in det(0, "tcp/7070")' \
-	'st(0, "tcp/8080") == "fail" and "timed out" in det(0, "tcp/8080")' \
-	'st(0, "tcp/9090") == "fail" and "REJECT" in det(0, "tcp/9090")' \
-	'st(0, "udp/5353") == "fail" and "never reached" in det(0, "udp/5353")' \
-	'st(0, "udp/5454") == "fail" and "port-unreachable" in det(0, "udp/5454")' \
-	'st(0, "udp/5555") == "warn" and "reply never got back" in det(0, "udp/5555")' \
-	'st(0, "udp/6061") == "ok" and "SNAT" in det(0, "udp/6061")' \
+	'code(0, "tcp/6060") == "tcp.snat" and "10.9.0.11" in det(0, "tcp/6060")' \
+	'st(0, "tcp/7070") == "warn" and code(0, "tcp/7070") == "tcp.intercepted"' \
+	'code(0, "tcp/8080") == "tcp.dropped"' \
+	'code(0, "tcp/9090") == "tcp.rejected"' \
+	'code(0, "udp/5353") == "udp.dropped"' \
+	'code(0, "udp/5454") == "udp.rejected"' \
+	'st(0, "udp/5555") == "warn" and code(0, "udp/5555") == "udp.reply_filtered"' \
+	'code(0, "udp/6061") == "udp.snat"' \
 	'st(0, "pmtu") == "skip"' \
-	'verdict(0).startswith("PARTIAL")' \
+	'd["directions"][0]["result"] == "partial"' \
 	'd["directions"][1]["ok"] and st(1, "icmp") == "ok"'
+
+# Straight after a run whose listeners saw nothing (so they'd otherwise
+# linger until their timeout), a rerun must find the ports free again.
+reset
+ns hb iptables -A INPUT -i dB -p tcp --dport 8080 -j DROP
+ns hb iptables -A INPUT -i dB -p udp --dport 5353 -j DROP
+for run in 1 2; do
+	scenario "rerun-$run" "$data -p 8080 -u 5353 -bw=false -trace never -one-way ha hb" \
+		'rc == 1' 'code(0, "tcp/8080") == "tcp.dropped"' 'code(0, "udp/5353") == "udp.dropped"'
+done
+if ns hb ss -Hlntu | grep -qE ':(8080|5353) '; then
+	echo "--- leftovers: listeners still up on hb after the run"; fails=$((fails + 1))
+fi
 
 reset
 ns hb iptables -A INPUT -i dB -m length --length 1401:65535 -j DROP
-scenario blackhole "$data -p 22 -bw=false -one-way" \
+scenario blackhole "$data -p 22 -bw=false -one-way ha hb" \
 	'rc == 0' \
-	'st(0, "pmtu") == "warn" and "black hole" in det(0, "pmtu") and det(0, "pmtu").startswith("1400")'
+	'code(0, "pmtu") == "pmtu.blackhole" and det(0, "pmtu").startswith("1400")'
 
 reset
-scenario dns "-a-addr 10.9.0.1 -b-addr hb.lab -p 22 -bw=false -one-way" \
+scenario dns "-a-addr 10.9.0.1 -b-addr hb.lab -p 22 -bw=false -one-way ha hb" \
 	'rc == 0' \
 	'st(0, "dns") == "ok" and "10.9.0.2" in det(0, "dns")' \
 	'd["directions"][0]["ip"] == "10.9.0.2"'
 
-scenario noroute "-p 22 -bw=false -one-way -trace never" \
+scenario noroute "-p 22 -bw=false -one-way -trace never ha hb" \
 	'rc == 1' \
 	'd["directions"][0]["target"] == "10.8.2.2"' \
-	'st(0, "route") == "fail"' \
+	'code(0, "route") == "route.none"' \
 	'st(0, "hint") == "info" and "10.9.0.2" in det(0, "hint")' \
-	'verdict(0).startswith("UNREACHABLE")'
+	'd["directions"][0]["result"] == "unreachable"'
+
+# The local backend: A is the machine the tests run on (the root
+# namespace), which reaches hb over its management link.
+reset
+scenario local "-a-addr 10.8.2.1 -b-addr 10.8.2.2 -p 22,8080 -u 5353 -bw=false -trace never local:// hb" \
+	'rc == 0' 'd["ok"]' \
+	'd["hosts"][0]["target"] == "local://"' \
+	'code(0, "tcp/8080") == "tcp.open" and code(1, "tcp/8080") == "tcp.open"' \
+	'code(0, "udp/5353") == "udp.open"'
+
+# Failures to get onto a machine still give JSON on stdout, exit 2.
+scenario unknown-backend "nope://x hb" \
+	'rc == 2' 'not d["ok"]' 'd["schema_version"] == 1' '"unknown backend" in d["error"]'
+scenario ssh-down "-p 22 ha root@10.8.1.99" \
+	'rc == 2' 'not d["ok"]' 'd["error"].startswith("ssh root@10.8.1.99")'
 
 if has_v6; then
 	reset
 	ns hb ip6tables -A INPUT -i dB -p tcp --dport 8081 -j DROP
-	scenario ipv6 "-a-addr fd00:9::1 -b-addr fd00:9::2 -p 22,8080,8081 -u 5353 -bw=false -trace never" \
+	scenario ipv6 "-a-addr fd00:9::1 -b-addr fd00:9::2 -p 22,8080,8081 -u 5353 -bw=false -trace never ha hb" \
 		'rc == 1' \
 		'st(0, "route") == "ok" and st(0, "icmp") == "ok"' \
 		'st(0, "tcp/22") == "ok"' \
@@ -133,13 +162,13 @@ for t in bash timeout sleep ss; do ln -sf "$(command -v "$t")" "$fb/$t"; done
 listen() { # listen TOOL PROTO PORT -- with only TOOL to listen with
 	rm -f "$fb/socat" "$fb/nc"
 	ln -sf "$(command -v "$1")" "$fb/$1"
-	ns hb env PATH="$fb" bash -s -- "$2" "$3" 4 4 <"$here/../../internal/probe/scripts/listen.sh" >"$work/listen.out" &
+	ns hb env PATH="$fb" bash -s -- "$2" "$3" 4 4 <"$scripts/listen.sh" >"$work/listen.out" &
 	sleep 0.6
 }
 fallback() { # fallback NAME PROBE-SCRIPT PORT WANT-PROBE-LINE WANT-LISTENER-LINE...
 	local name=$1 probe=$2 port=$3 want=$4 out
 	shift 4
-	out=$(ns ha bash -s -- 10.9.0.2 "$port" 2 <"$here/../../internal/probe/scripts/$probe.sh")
+	out=$(ns ha bash -s -- 10.9.0.2 "$port" 2 <"$scripts/$probe.sh")
 	wait
 	echo "--- fallback $name"
 	for w in "$@"; do

@@ -1,14 +1,19 @@
-package probe
+package shell
 
 import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/dcyber-lab/reachable/internal/node"
 )
 
-// kv parses key=value lines. Repeated keys keep every value in order.
+// The scripts talk back in key=value lines; kv parses them. Repeated keys
+// keep every value in order.
 func kv(s string) map[string][]string {
 	m := map[string][]string{}
 	for _, line := range strings.Split(s, "\n") {
@@ -26,49 +31,30 @@ func first(m map[string][]string, k string) string {
 	return ""
 }
 
-func parseFacts(s string) Facts {
+func parseFacts(s string) (node.Facts, map[string]bool) {
 	m := kv(s)
-	f := Facts{
+	f := node.Facts{
 		Hostname: first(m, "hostname"),
 		Arch:     first(m, "arch"),
 		Kernel:   first(m, "kernel"),
 		User:     first(m, "user"),
-		Tools:    map[string]bool{},
 	}
+	tools := map[string]bool{}
 	for _, t := range m["tool"] {
-		f.Tools[t] = true
+		tools[t] = true
+		f.Capabilities = append(f.Capabilities, t)
 	}
+	sort.Strings(f.Capabilities)
 	for _, a := range m["addr"] {
 		ip, dev, _ := strings.Cut(a, " ")
-		f.Addrs = append(f.Addrs, Addr{IP: ip, Dev: dev})
+		f.Addrs = append(f.Addrs, node.Addr{IP: ip, Dev: dev})
 	}
-	return f
+	return f, tools
 }
 
-// Route is the parsed first line of `ip route get`.
-type Route struct {
-	Dev, Src, Via string
-	MTU           int
-}
-
-func (r Route) String() string {
-	s := "dev " + r.Dev
-	if r.Src != "" {
-		s += " src " + r.Src
-	}
-	if r.Via != "" {
-		s += " via " + r.Via
-	} else {
-		s += " (directly connected)"
-	}
-	if r.MTU > 0 {
-		s += fmt.Sprintf(", mtu %d", r.MTU)
-	}
-	return s
-}
-
-func parseRoute(line string, mtu string) Route {
-	var r Route
+// parseRoute reads the first line of `ip route get` plus the device's MTU.
+func parseRoute(line string, mtu string) node.Route {
+	var r node.Route
 	f := strings.Fields(line)
 	for i := 0; i+1 < len(f); i++ {
 		switch f[i] {
@@ -84,19 +70,13 @@ func parseRoute(line string, mtu string) Route {
 	return r
 }
 
-// Ping is the summary of a ping run.
-type Ping struct {
-	Sent, Received int
-	AvgMS          float64
-}
-
 var (
 	pingCounts = regexp.MustCompile(`(\d+) packets transmitted, (\d+) (?:packets )?received`)
 	pingRTT    = regexp.MustCompile(`= [\d.]+/([\d.]+)/`)
 )
 
-func parsePing(out string) (Ping, bool) {
-	var p Ping
+func parsePing(out string) (node.Ping, bool) {
+	var p node.Ping
 	m := pingCounts.FindStringSubmatch(out)
 	if m == nil {
 		return p, false
@@ -109,41 +89,70 @@ func parsePing(out string) (Ping, bool) {
 	return p, true
 }
 
-// Conn is how a TCP connect attempt ended.
-type Conn string
-
-const (
-	ConnOpen    Conn = "open"
-	ConnTimeout Conn = "timeout"
-	ConnRefused Conn = "refused"
-	ConnNoRoute Conn = "no-route"
-	ConnError   Conn = "error"
-)
-
-func classifyConnect(out string) (Conn, int, string) {
+// parseConnect reads connect.sh's rc=, ms= and err= lines.
+func parseConnect(out string) node.Dial {
 	m := kv(out)
 	rc, _ := strconv.Atoi(first(m, "rc"))
 	ms, _ := strconv.Atoi(first(m, "ms"))
-	msg := first(m, "err")
+	d := node.Dial{Elapsed: time.Duration(ms) * time.Millisecond, Msg: first(m, "err")}
 	// bash prefixes errors with "bash: connect: " / "bash: line 1: ...".
-	if i := strings.LastIndex(msg, ": "); i >= 0 {
-		msg = msg[i+2:]
+	if i := strings.LastIndex(d.Msg, ": "); i >= 0 {
+		d.Msg = d.Msg[i+2:]
 	}
-	low := strings.ToLower(msg)
+	low := strings.ToLower(d.Msg)
 	switch {
 	case first(m, "rc") == "":
-		return ConnError, 0, "no result from connect script"
+		d.Outcome, d.Msg = node.Failed, "no result from connect script"
 	case rc == 0:
-		return ConnOpen, ms, ""
+		d.Outcome = node.Open
 	case rc == 124:
-		return ConnTimeout, ms, ""
+		d.Outcome = node.Timeout
 	case strings.Contains(low, "refused"):
-		return ConnRefused, ms, msg
+		d.Outcome = node.Refused
 	case strings.Contains(low, "no route"), strings.Contains(low, "unreachable"):
-		return ConnNoRoute, ms, msg
+		d.Outcome = node.Unreachable
 	default:
-		return ConnError, ms, msg
+		d.Outcome = node.Failed
 	}
+	return d
+}
+
+// parseUDP reads udp.sh's sent=, reply= and err= lines.
+func parseUDP(out string) node.Dial {
+	m := kv(out)
+	msg := first(m, "err")
+	switch {
+	case first(m, "sent") != "1":
+		if msg == "" {
+			msg = "no result from udp script"
+		}
+		return node.Dial{Outcome: node.Failed, Msg: msg}
+	case first(m, "reply") == "pong":
+		return node.Dial{Outcome: node.Open}
+	case strings.Contains(strings.ToLower(msg), "refused"):
+		return node.Dial{Outcome: node.Refused, Msg: msg}
+	case msg != "":
+		return node.Dial{Outcome: node.Failed, Msg: msg}
+	default:
+		return node.Dial{Outcome: node.Timeout}
+	}
+}
+
+func parsePMTU(out string) (node.PMTU, error) {
+	m := kv(out)
+	if e := first(m, "err"); e != "" {
+		return node.PMTU{}, fmt.Errorf("%s", e)
+	}
+	n, err := strconv.Atoi(first(m, "pmtu"))
+	if err != nil {
+		return node.PMTU{}, fmt.Errorf("no result from pmtu script")
+	}
+	how := map[string]node.PMTUMethod{
+		"iface":  node.PMTUInterface,
+		"icmp":   node.PMTUReported,
+		"search": node.PMTUProbed,
+	}[first(m, "how")]
+	return node.PMTU{Bytes: n, Method: how}, nil
 }
 
 func parseIperf(out string) (float64, error) {
@@ -174,14 +183,4 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
-}
-
-func humanBits(bps float64) string {
-	units := []string{"bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"}
-	i := 0
-	for bps >= 1000 && i < len(units)-1 {
-		bps /= 1000
-		i++
-	}
-	return fmt.Sprintf("%.2f %s", bps, units[i])
 }

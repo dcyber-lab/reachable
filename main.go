@@ -1,11 +1,13 @@
-// reachable checks whether two servers can reach each other: it ssh's into
-// both, and from each one probes the other (DNS, route, ICMP, TCP ports with
-// a temporary listener, path MTU, bandwidth).
+// reachable checks whether two machines can reach each other: it gets onto
+// both (over ssh by default), and from each one probes the other (DNS,
+// route, ICMP, TCP/UDP ports through a temporary listener, path MTU,
+// bandwidth).
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,22 +16,32 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/dcyber-lab/reachable/internal/node"
 	"github.com/dcyber-lab/reachable/internal/probe"
-	"github.com/dcyber-lab/reachable/internal/remote"
 	"github.com/dcyber-lab/reachable/internal/report"
+	"github.com/dcyber-lab/reachable/internal/transport"
 )
 
 var version = "dev"
 
-const usage = `usage: reachable [flags] HOST_A HOST_B
+// schemaVersion is bumped whenever the -json output changes incompatibly.
+const schemaVersion = 1
 
-HOST_A and HOST_B are anything you would pass to ssh: an alias from
-~/.ssh/config, user@host, and so on. reachable ssh's into both and checks
-A -> B and B -> A.
+const usage = `usage: reachable [flags] A B
 
-Exit status: 0 both directions reachable on every tested port, 1 not,
-2 usage or ssh error.
+A and B are the two machines, each written as BACKEND://TARGET:
+
+  ssh://web1, web1       over ssh; TARGET is anything ssh takes (an alias
+                         from ~/.ssh/config, user@host, ...). The default.
+  local://               the machine reachable runs on
+
+reachable gets onto both and checks A -> B and B -> A.
+
+Exit status: 0 every tested port open in every direction, 1 not,
+2 bad usage or a machine couldn't be reached. With -json, stdout is JSON
+in every case, errors included.
 
 flags:
 `
@@ -38,82 +50,90 @@ func main() {
 	os.Exit(run())
 }
 
+type flags struct {
+	tcp, udp     string
+	aAddr, bAddr string
+	oneWay       bool
+	count        int
+	timeout      time.Duration
+	trace        string
+	bw           bool
+	iperfPort    int
+	iperfTime    time.Duration
+	ssh          string
+	batch        bool
+	json         bool
+	version      bool
+}
+
 func run() int {
-	var (
-		ports     = flag.String("p", "22", "comma-separated TCP ports to test in both directions")
-		udpPorts  = flag.String("u", "", "comma-separated UDP ports to test in both directions")
-		aAddr     = flag.String("a-addr", "", "address B should dial to reach A (default: A's HostName from ssh -G)")
-		bAddr     = flag.String("b-addr", "", "address A should dial to reach B (default: B's HostName from ssh -G)")
-		oneWay    = flag.Bool("one-way", false, "only check A -> B")
-		count     = flag.Int("c", 5, "pings per direction")
-		ctimeout  = flag.Int("t", 3, "TCP connect timeout, seconds")
-		trace     = flag.String("trace", "auto", "run tracepath/traceroute: auto (on failure), always, never")
-		bw        = flag.Bool("bw", true, "measure bandwidth with iperf3 when both hosts have it")
-		iperfPort = flag.Int("iperf-port", 5201, "port for the iperf3 test")
-		iperfSecs = flag.Int("iperf-time", 3, "seconds per iperf3 test")
-		sshOpts   = flag.String("ssh", "", `extra ssh arguments, e.g. "-p 2222 -i ~/.ssh/key"`)
-		asJSON    = flag.Bool("json", false, "print JSON instead of text")
-		showVer   = flag.Bool("version", false, "print version")
-	)
+	var f flags
+	flag.StringVar(&f.tcp, "p", "22", "comma-separated TCP ports to test in both directions")
+	flag.StringVar(&f.udp, "u", "", "comma-separated UDP ports to test in both directions")
+	flag.StringVar(&f.aAddr, "a-addr", "", "address B should dial to reach A (default: from A's backend, e.g. its ssh HostName)")
+	flag.StringVar(&f.bAddr, "b-addr", "", "address A should dial to reach B (default: from B's backend)")
+	flag.BoolVar(&f.oneWay, "one-way", false, "only check A -> B")
+	flag.IntVar(&f.count, "c", 5, "pings per direction")
+	flag.DurationVar(&f.timeout, "t", 3*time.Second, "connect timeout per port")
+	flag.StringVar(&f.trace, "trace", "auto", "trace the path: auto (when something failed), always, never")
+	flag.BoolVar(&f.bw, "bw", true, "measure bandwidth (iperf3) when both machines can")
+	flag.IntVar(&f.iperfPort, "iperf-port", 5201, "port for the bandwidth test")
+	flag.DurationVar(&f.iperfTime, "iperf-time", 3*time.Second, "length of each bandwidth test")
+	flag.StringVar(&f.ssh, "ssh", "", `extra ssh arguments, e.g. "-p 2222 -i ~/.ssh/key"`)
+	flag.BoolVar(&f.batch, "batch", false, "never prompt (passwords, host keys); implied when stdin is not a terminal")
+	flag.BoolVar(&f.json, "json", false, "print JSON (see README for the schema)")
+	flag.BoolVar(&f.version, "version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *showVer {
+	if f.version {
 		fmt.Println(version)
 		return 0
 	}
+
+	out := output{json: f.json, pr: report.Printer{W: os.Stdout, Color: isTerminal(os.Stdout)}}
 	if flag.NArg() != 2 {
+		if f.json {
+			return out.fail(errors.New("need exactly two machines, A and B"))
+		}
 		flag.Usage()
 		return 2
 	}
-	if *trace != "auto" && *trace != "always" && *trace != "never" {
-		fmt.Fprintln(os.Stderr, "reachable: -trace must be auto, always or never")
-		return 2
-	}
-	portList, err := parsePorts(*ports)
+	opt, err := f.options()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "reachable:", err)
-		return 2
+		return out.fail(err)
 	}
-	udpList, err := parsePorts(*udpPorts)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "reachable:", err)
-		return 2
-	}
-	extra := strings.Fields(*sshOpts)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Unix sockets have a ~104 byte path limit; $TMPDIR on macOS eats most
-	// of that, so keep the control sockets under /tmp.
-	ctlDir, err := os.MkdirTemp("/tmp", "reachable-")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "reachable:", err)
-		return 2
+	ssh := &transport.SSH{
+		Args:        strings.Fields(f.ssh),
+		Interactive: !f.batch && isTerminal(os.Stdin),
 	}
-	defer os.RemoveAll(ctlDir)
+	defer ssh.Close()
+	backends := node.Registry{
+		"ssh":   ssh,
+		"local": transport.Local{},
+	}
 
 	sides := []*probe.Side{
-		{Label: "A", Target: flag.Arg(0), Addr: *aAddr},
-		{Label: "B", Target: flag.Arg(1), Addr: *bAddr},
+		{Label: "A", Target: flag.Arg(0), Addr: f.aAddr},
+		{Label: "B", Target: flag.Arg(1), Addr: f.bAddr},
 	}
+	// One at a time, so two password prompts don't interleave.
 	for _, s := range sides {
+		n, addr, err := backends.Open(ctx, s.Target)
+		if err != nil {
+			return out.fail(err)
+		}
+		defer n.Close()
+		s.Node = n
 		if s.Addr == "" {
-			if s.Addr, err = remote.Resolve(s.Target, extra); err != nil {
-				fmt.Fprintln(os.Stderr, "reachable:", err)
-				return 2
-			}
+			s.Addr = addr
 		}
-		s.Host = remote.New(s.Target, ctlDir, extra)
-		// One at a time, so two password prompts don't interleave.
-		if err := s.Host.Open(ctx); err != nil {
-			fmt.Fprintln(os.Stderr, "reachable:", err)
-			return 2
-		}
-		defer s.Host.Close()
 	}
 
 	var wg sync.WaitGroup
@@ -122,67 +142,126 @@ func run() int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = s.Gather(ctx)
+			s.Facts, errs[i] = s.Node.Facts(ctx)
+			if errs[i] != nil {
+				errs[i] = fmt.Errorf("%s (%s): %w", s.Label, s.Target, errs[i])
+			}
 		}()
 	}
 	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "reachable:", err)
-			return 2
+	if err := errors.Join(errs...); err != nil {
+		return out.fail(err)
+	}
+	for _, s := range sides {
+		// The backend couldn't say how to reach this machine (local://
+		// can't): take its first address, and let the hint point at the
+		// others if that turns out wrong.
+		if s.Addr == "" && len(s.Facts.Addrs) > 0 {
+			s.Addr = s.Facts.Addrs[0].IP
+		}
+		if s.Addr == "" {
+			return out.fail(fmt.Errorf("%s (%s): no address to dial it at; pass -%s-addr",
+				s.Label, s.Target, strings.ToLower(s.Label)))
 		}
 	}
+	out.sides(sides)
 
-	opt := probe.Options{
-		Ports:          portList,
-		UDPPorts:       udpList,
-		PingCount:      *count,
-		ConnectTimeout: *ctimeout,
-		Trace:          *trace,
-		Bandwidth:      *bw,
-		IperfPort:      *iperfPort,
-		IperfSeconds:   *iperfSecs,
-	}
-	pr := report.Printer{W: os.Stdout, Color: isTerminal(os.Stdout)}
-	if !*asJSON {
-		for _, s := range sides {
-			pr.Side(s)
-		}
-	}
-
-	// Directions run one after the other: two iperf3 runs at once would
-	// share the link and both numbers would be wrong.
+	// Directions run one after the other: two bandwidth tests at once
+	// would share the link and both numbers would be wrong.
 	pairs := [][2]*probe.Side{{sides[0], sides[1]}}
-	if !*oneWay {
+	if !f.oneWay {
 		pairs = append(pairs, [2]*probe.Side{sides[1], sides[0]})
 	}
 	var dirs []*probe.Direction
 	allOK := true
 	for _, pair := range pairs {
 		if ctx.Err() != nil {
-			return 2
+			return out.fail(ctx.Err())
 		}
 		d := probe.Run(ctx, pair[0], pair[1], opt)
 		dirs = append(dirs, d)
 		allOK = allOK && d.OK
-		if !*asJSON {
-			pr.Direction(d)
-		}
+		out.direction(d)
 	}
-
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(struct {
-			Hosts      []*probe.Side      `json:"hosts"`
-			Directions []*probe.Direction `json:"directions"`
-			OK         bool               `json:"ok"`
-		}{sides, dirs, allOK})
-	}
+	out.done(sides, dirs, allOK)
 	if !allOK {
 		return 1
 	}
 	return 0
+}
+
+func (f flags) options() (probe.Options, error) {
+	if f.trace != "auto" && f.trace != "always" && f.trace != "never" {
+		return probe.Options{}, errors.New("-trace must be auto, always or never")
+	}
+	tcp, err := parsePorts(f.tcp)
+	if err != nil {
+		return probe.Options{}, err
+	}
+	udp, err := parsePorts(f.udp)
+	if err != nil {
+		return probe.Options{}, err
+	}
+	return probe.Options{
+		TCPPorts:       tcp,
+		UDPPorts:       udp,
+		PingCount:      f.count,
+		ConnectTimeout: f.timeout,
+		Trace:          f.trace,
+		Bandwidth:      f.bw,
+		IperfPort:      f.iperfPort,
+		IperfTime:      f.iperfTime,
+	}, nil
+}
+
+// output writes either text as results come in, or one JSON document at
+// the end (or on failure).
+type output struct {
+	json bool
+	pr   report.Printer
+}
+
+type document struct {
+	SchemaVersion int                `json:"schema_version"`
+	OK            bool               `json:"ok"`
+	Error         string             `json:"error,omitempty"`
+	Hosts         []*probe.Side      `json:"hosts,omitempty"`
+	Directions    []*probe.Direction `json:"directions,omitempty"`
+}
+
+func (o output) sides(sides []*probe.Side) {
+	if !o.json {
+		for _, s := range sides {
+			o.pr.Side(s)
+		}
+	}
+}
+
+func (o output) direction(d *probe.Direction) {
+	if !o.json {
+		o.pr.Direction(d)
+	}
+}
+
+func (o output) done(sides []*probe.Side, dirs []*probe.Direction, ok bool) {
+	if o.json {
+		o.write(document{SchemaVersion: schemaVersion, OK: ok, Hosts: sides, Directions: dirs})
+	}
+}
+
+func (o output) fail(err error) int {
+	if o.json {
+		o.write(document{SchemaVersion: schemaVersion, Error: err.Error()})
+	} else {
+		fmt.Fprintln(os.Stderr, "reachable:", err)
+	}
+	return 2
+}
+
+func (o output) write(doc document) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(doc)
 }
 
 func parsePorts(s string) ([]int, error) {
