@@ -13,27 +13,31 @@ input when nobody is at the terminal, and how it reaches machines is a
 pluggable backend (ssh today).
 
 ```
-$ reachable -p 22,5432 web1 db1
-A  web1  deploy@web1  x86_64 6.8.0
-   dialed as 10.0.1.12; addrs: 10.0.1.12@eth0
-   can use: getent ip iperf3 ping python3 ss timeout tracepath
-B  db1  deploy@db1  x86_64 6.8.0
-   dialed as 10.0.2.7; addrs: 10.0.2.7@eth0
-   can use: getent ip ping python3 ss timeout
+$ reachable -p 22,5432,6379 web1 db1
+...                                   (every check, as it runs)
 
-A -> B  10.0.2.7
-  ok    route     dev eth0 src 10.0.1.12 via 10.0.1.1, mtu 9001
-  ok    icmp      5/5 replies, avg 0.41 ms
-  ok    tcp/22    open in 2 ms (existing service on B)
-  fail  tcp/5432  timed out after 3s: packets dropped (firewall / security group / ACL)
-  warn  pmtu      1500; bigger packets vanish without ICMP frag-needed: PMTU black hole, ...
-  skip  bw        not measured while ports are blocked
-  info  trace     A -> 10.0.2.7
-               1?: [LOCALHOST]                      pmtu 9001
-               ...
-  => PARTIAL: tcp/22 open, tcp/5432 blocked
-...
+────────────────────────────────────────────────────────────────
+ Summary
+────────────────────────────────────────────────────────────────
+ A web1 → B db1  PARTIAL     ✓ tcp/22  ✗ tcp/5432  ✗ tcp/6379
+ B db1 → A web1  PARTIAL     ✓ tcp/22  ✓ tcp/5432  ✗ tcp/6379
+
+ ✗ tcp/5432  A → B  dropped on B before reaching the socket by netfilter (observed)
+     A out ── network ── B NIC ── B XDP ── B in ✗ ── B socket
+     iptables-save filter: -A INPUT -i eth0 -p tcp -m tcp --dport 5432 -j DROP
+     kernel: NETFILTER_DROP in nft_do_chain
+ ✗ tcp/6379  A → B  B's reply dropped between B and A by network (inferred)
+     A out ── network ── B NIC ── B XDP ── B in ── B socket
+     reply B out ── network ✗ ── A in
+     the way back is filtered: asymmetric routing through a stateful firewall is the usual cause
+ ! pmtu      A ⇄ B  1400; bigger packets vanish without ICMP frag-needed: PMTU black hole, ...
+
+ -v shows the evidence behind each located drop
+────────────────────────────────────────────────────────────────
 ```
+
+Every check is printed as it runs; the summary at the end lists each
+problem once, with where its packets died drawn on their way.
 
 ## Install
 
@@ -77,6 +81,7 @@ A and B are written `BACKEND://TARGET`:
 | `-ssh` | | extra ssh args, e.g. `"-p 2222 -i ~/.ssh/key"` |
 | `-locate` | on | when a port fails, find where its packets die (see below) |
 | `-batch` | when stdin isn't a terminal | never prompt for passwords or host keys; fail instead |
+| `-v` | off | show the evidence behind each located drop |
 | `-json` | off | machine-readable output, see below |
 
 Exit status: `0` every tested port is open in every direction, `1` not,

@@ -26,9 +26,6 @@ import (
 
 var version = "dev"
 
-// schemaVersion is bumped whenever the -json output changes incompatibly.
-const schemaVersion = 1
-
 const usage = `usage: reachable [flags] A B
 
 A and B are the two machines, each written as BACKEND://TARGET:
@@ -64,6 +61,7 @@ type flags struct {
 	ssh          string
 	batch        bool
 	json         bool
+	verbose      bool
 	version      bool
 }
 
@@ -84,6 +82,7 @@ func run() int {
 	flag.StringVar(&f.ssh, "ssh", "", `extra ssh arguments, e.g. "-p 2222 -i ~/.ssh/key"`)
 	flag.BoolVar(&f.batch, "batch", false, "never prompt (passwords, host keys); implied when stdin is not a terminal")
 	flag.BoolVar(&f.json, "json", false, "print JSON (see README for the schema)")
+	flag.BoolVar(&f.verbose, "v", false, "show the evidence behind each located drop")
 	flag.BoolVar(&f.version, "version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
@@ -95,7 +94,7 @@ func run() int {
 		return 0
 	}
 
-	out := output{json: f.json, pr: report.Printer{W: os.Stdout, Color: isTerminal(os.Stdout)}}
+	out := output{json: f.json, pr: report.Printer{W: os.Stdout, Color: isTerminal(os.Stdout), Verbose: f.verbose}}
 	if flag.NArg() != 2 {
 		if f.json {
 			return out.fail(errors.New("need exactly two machines, A and B"))
@@ -224,14 +223,6 @@ type output struct {
 	pr   report.Printer
 }
 
-type document struct {
-	SchemaVersion int                `json:"schema_version"`
-	OK            bool               `json:"ok"`
-	Error         string             `json:"error,omitempty"`
-	Hosts         []*probe.Side      `json:"hosts,omitempty"`
-	Directions    []*probe.Direction `json:"directions,omitempty"`
-}
-
 func (o output) sides(sides []*probe.Side) {
 	if !o.json {
 		for _, s := range sides {
@@ -248,20 +239,22 @@ func (o output) direction(d *probe.Direction) {
 
 func (o output) done(sides []*probe.Side, dirs []*probe.Direction, ok bool) {
 	if o.json {
-		o.write(document{SchemaVersion: schemaVersion, OK: ok, Hosts: sides, Directions: dirs})
+		o.write(report.Document{SchemaVersion: report.SchemaVersion, OK: ok, Version: version, Hosts: sides, Directions: dirs})
+		return
 	}
+	o.pr.Summary(sides, dirs)
 }
 
 func (o output) fail(err error) int {
 	if o.json {
-		o.write(document{SchemaVersion: schemaVersion, Error: err.Error()})
+		o.write(report.Document{SchemaVersion: report.SchemaVersion, Version: version, Error: err.Error()})
 	} else {
 		fmt.Fprintln(os.Stderr, "reachable:", err)
 	}
 	return 2
 }
 
-func (o output) write(doc document) {
+func (o output) write(doc report.Document) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(doc)
